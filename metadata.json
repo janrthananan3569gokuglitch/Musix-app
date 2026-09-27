@@ -1,0 +1,7 @@
+{
+  "name": "XP Music Vault",
+  "description": "Ultra-low-latency futuristic music player & DSP sound vault featuring 14 pro audio tools, 8D atmos, dynamic mastering, live BPM transient engine, and cyber visualizers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

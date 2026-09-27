@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Outer Vault Ring / Hexagon -->
+    <path
+        android:strokeWidth="2.5"
+        android:strokeColor="#3300F5D4"
+        android:pathData="M54,26 L78,38 L78,70 L54,82 L30,70 L30,38 Z" />
+
+    <!-- Core Vault Shield Gradient Fill -->
+    <path
+        android:pathData="M54,29 L75,40 L75,68 L54,79 L33,68 L33,40 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="33"
+                android:startY="29"
+                android:endX="75"
+                android:endY="79"
+                android:type="linear">
+                <item android:color="#FF00F5D4" android:offset="0.0" />
+                <item android:color="#FF7B2CBF" android:offset="0.6" />
+                <item android:color="#FFFF007F" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Center Cutout: XP Vault & Waveform -->
+    <path
+        android:fillColor="#0D1117"
+        android:pathData="M54,34 L71,43 L71,65 L54,74 L37,65 L37,43 Z" />
+
+    <!-- Neon Audio Equalizer Bars & Pulse -->
+    <!-- Bar 1 -->
+    <path
+        android:fillColor="#00F5D4"
+        android:pathData="M43,51 L46,51 L46,57 L43,57 Z" />
+    <!-- Bar 2 -->
+    <path
+        android:fillColor="#00F5D4"
+        android:pathData="M48,46 L51,46 L51,62 L48,62 Z" />
+    <!-- Center Peak Bar (Master / Vibe) -->
+    <path
+        android:fillColor="#FF007F"
+        android:pathData="M53,41 L56,41 L56,67 L53,67 Z" />
+    <!-- Bar 4 -->
+    <path
+        android:fillColor="#9D4EDD"
+        android:pathData="M58,45 L61,45 L61,63 L58,63 Z" />
+    <!-- Bar 5 -->
+    <path
+        android:fillColor="#9D4EDD"
+        android:pathData="M63,50 L66,50 L66,58 L63,58 Z" />
+
+    <!-- Glowing Transient Diamond Dot -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54.5,36 L56,37.5 L54.5,39 L53,37.5 Z" />
+</vector>
