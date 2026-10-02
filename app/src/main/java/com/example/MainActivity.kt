@@ -442,8 +442,8 @@ class MainActivity : ComponentActivity() {
 
     fun getAudioService(): AudioVaultService? = audioVaultService
 
-    fun updateServiceMetadata(title: String, artist: String, isPlaying: Boolean, durationMs: Long, positionMs: Long, artUrl: String = "") {
-        audioVaultService?.updateServiceState(title, artist, isPlaying, durationMs, positionMs, artUrl)
+    fun updateServiceMetadata(title: String, artist: String, isPlaying: Boolean, durationMs: Long, positionMs: Long, audioPath: String = "") {
+        audioVaultService?.updateServiceState(title, artist, isPlaying, durationMs, positionMs, audioPath)
     }
 
     fun stopPlaybackService() {
@@ -515,12 +515,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
-        evaluateJs("window.onNativeVisibilityChanged && window.onNativeVisibilityChanged(false)")
+        evaluateJs("window.isSystemInterrupted = true; if (window.onNativeVisibilityChanged) window.onNativeVisibilityChanged(false);")
     }
 
     override fun onResume() {
         super.onResume()
-        evaluateJs("window.onNativeVisibilityChanged && window.onNativeVisibilityChanged(true)")
+        evaluateJs("window.isSystemInterrupted = false; if (window.onNativeVisibilityChanged) window.onNativeVisibilityChanged(true);")
     }
 
     override fun onDestroy() {

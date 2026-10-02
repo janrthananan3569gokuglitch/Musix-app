@@ -16,6 +16,7 @@ import android.graphics.BitmapFactory
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
 import android.media.audiofx.AudioEffect
 import android.media.audiofx.BassBoost
@@ -332,8 +333,7 @@ class AudioVaultService : Service() {
                     isTrackPlaying = false
                     stopProgressUpdates()
                     updateServiceState(currentTitle, currentArtist, false, currentDurationMs, currentDurationMs)
-                    onPlaybackStateChanged?.invoke(false, currentDurationMs, currentDurationMs)
-                    // Rely strictly on onPlaybackCompleted (do NOT fire NEXT action callback to prevent double skip)
+                    // Trigger completion callback to automatically advance to next track
                     onPlaybackCompleted?.invoke()
                 }
 
@@ -936,13 +936,15 @@ class AudioVaultService : Service() {
                 .setAcceptsDelayedFocusGain(true)
                 .setOnAudioFocusChangeListener { focusChange ->
                     when (focusChange) {
-                        AudioManager.AUDIOFOCUS_LOSS, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                        AudioManager.AUDIOFOCUS_LOSS,
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
                             pausePlayback()
+                            onActionCallback?.invoke("PAUSE")
                             onAudioFocusChanged?.invoke(true)
                         }
                         AudioManager.AUDIOFOCUS_GAIN -> {
                             onAudioFocusChanged?.invoke(false)
-                            resumePlayback()
                         }
                     }
                 }
@@ -953,12 +955,14 @@ class AudioVaultService : Service() {
             @Suppress("DEPRECATION")
             am.requestAudioFocus(
                 { focusChange ->
-                    if (focusChange == AudioManager.AUDIOFOCUS_LOSS || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
+                    if (focusChange == AudioManager.AUDIOFOCUS_LOSS ||
+                        focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
+                        focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
                         pausePlayback()
+                        onActionCallback?.invoke("PAUSE")
                         onAudioFocusChanged?.invoke(true)
                     } else if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
                         onAudioFocusChanged?.invoke(false)
-                        resumePlayback()
                     }
                 },
                 AudioManager.STREAM_MUSIC,
@@ -1027,13 +1031,9 @@ class AudioVaultService : Service() {
     private var currentAlbumArtBitmap: Bitmap? = null
     private var lastDecodedArtKey: String? = null
 
-    private fun requestAsyncArtDecode(artUrlOrBase64: String) {
-        if (artUrlOrBase64.isBlank()) return
-        val key = if (artUrlOrBase64.length > 120) {
-            "${artUrlOrBase64.length}_${artUrlOrBase64.take(40)}_${artUrlOrBase64.takeLast(20)}"
-        } else {
-            artUrlOrBase64
-        }
+    private fun requestAsyncArtDecode(audioPath: String) {
+        if (audioPath.isBlank()) return
+        val key = audioPath
         if (key == lastDecodedArtKey && currentAlbumArtBitmap != null) {
             return
         }
@@ -1041,31 +1041,49 @@ class AudioVaultService : Service() {
         artExecutor.execute {
             try {
                 var bmp: Bitmap? = null
-                // Case 1: Base64 data URI or raw base64 string
-                if (artUrlOrBase64.startsWith("data:image") || (artUrlOrBase64.length > 80 && !artUrlOrBase64.startsWith("http"))) {
-                    val cleanBase64 = if (artUrlOrBase64.contains(",")) {
-                        artUrlOrBase64.substringAfter(",")
+
+                // 1. Direct MediaMetadataRetriever extraction natively in Kotlin bypassing JS Binder limit
+                val cleanPath = CoverArtResolver.resolveCleanPath(audioPath)
+                try {
+                    val retriever = MediaMetadataRetriever()
+                    if (audioPath.startsWith("content://")) {
+                        retriever.setDataSource(this, Uri.parse(audioPath))
                     } else {
-                        artUrlOrBase64
+                        val file = File(cleanPath)
+                        if (file.exists()) {
+                            retriever.setDataSource(file.absolutePath)
+                        } else {
+                            retriever.setDataSource(audioPath)
+                        }
                     }
-                    val bytes = Base64.decode(cleanBase64, Base64.DEFAULT)
-                    bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    val picBytes = retriever.embeddedPicture
+                    retriever.release()
+                    if (picBytes != null && picBytes.isNotEmpty()) {
+                        bmp = BitmapFactory.decodeByteArray(picBytes, 0, picBytes.size)
+                    }
+                } catch (e: Exception) {
+                    Log.d(tag, "MediaMetadataRetriever direct extraction: ${e.message}")
                 }
 
-                // Case 2: File path, content URI, or appassets URL via CoverArtResolver
+                // 2. CoverArtResolver fallback (MediaStore thumb, adjacent folder cover, custom artwork file)
                 if (bmp == null) {
-                    val bytes = CoverArtResolver.getArtBytes(this, artUrlOrBase64)
+                    val bytes = CoverArtResolver.getArtBytes(this, audioPath)
                     if (bytes != null && bytes.isNotEmpty()) {
                         bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                     }
                 }
 
-                if (bmp != null) {
-                    lastDecodedArtKey = key
-                    currentAlbumArtBitmap = bmp
-                    progressHandler.post {
-                        applyMetadataAndNotification()
-                    }
+                // 3. Fallback if a base64 was passed (legacy safeguard)
+                if (bmp == null && (audioPath.startsWith("data:image") || audioPath.length > 200)) {
+                    val cleanBase64 = if (audioPath.contains(",")) audioPath.substringAfter(",") else audioPath
+                    val bytes = Base64.decode(cleanBase64, Base64.DEFAULT)
+                    bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                }
+
+                lastDecodedArtKey = key
+                currentAlbumArtBitmap = bmp
+                progressHandler.post {
+                    applyMetadataAndNotification()
                 }
             } catch (e: Exception) {
                 Log.w(tag, "Failed to decode album art for MediaSession: ${e.message}")
@@ -1094,7 +1112,7 @@ class AudioVaultService : Service() {
         updateServiceState(title, artist, isPlaying, durationMs, positionMs, "")
     }
 
-    fun updateServiceState(title: String, artist: String, isPlaying: Boolean, durationMs: Long, positionMs: Long, artUrl: String) {
+    fun updateServiceState(title: String, artist: String, isPlaying: Boolean, durationMs: Long, positionMs: Long, audioPath: String) {
         currentTitle = title
         currentArtist = artist
         isTrackPlaying = isPlaying
@@ -1104,8 +1122,8 @@ class AudioVaultService : Service() {
             currentDurationMs = mediaPlayer?.duration?.toLong() ?: 0L
         }
 
-        if (artUrl.isNotBlank()) {
-            requestAsyncArtDecode(artUrl)
+        if (audioPath.isNotBlank()) {
+            requestAsyncArtDecode(audioPath)
         } else if (currentAlbumArtBitmap == null && currentPath.isNotBlank()) {
             requestAsyncArtDecode(currentPath)
         }

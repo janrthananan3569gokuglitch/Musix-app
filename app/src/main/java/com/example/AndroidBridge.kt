@@ -98,26 +98,34 @@ class AndroidBridge(
     private fun setupServiceHooks() {
         AudioVaultService.onPlaybackCompleted = {
             activity.runOnUiThread {
-                activity.evaluateJs("window.onNativePlaybackCompleted && window.onNativePlaybackCompleted()")
+                activity.evaluateJs("if (window.onNativePlaybackCompleted) window.onNativePlaybackCompleted();")
             }
         }
         AudioVaultService.onPlaybackStateChanged = { playing, pos, dur ->
             activity.runOnUiThread {
-                activity.evaluateJs("window.onNativePlaybackState && window.onNativePlaybackState($playing, $pos, $dur)")
+                if (!playing) {
+                    activity.evaluateJs("window.isPlaying = false; if (window.onNativePlaybackState) window.onNativePlaybackState(false, $pos, $dur);")
+                } else {
+                    activity.evaluateJs("if (window.onNativePlaybackState) window.onNativePlaybackState(true, $pos, $dur);")
+                }
             }
         }
         AudioVaultService.onActionCallback = { action ->
             activity.runOnUiThread {
-                activity.evaluateJs("window.onNativeMediaAction && window.onNativeMediaAction('$action')")
+                if (action == "PAUSE") {
+                    activity.evaluateJs("window.isPlaying = false; if (window.onNativeMediaAction) window.onNativeMediaAction('$action');")
+                } else {
+                    activity.evaluateJs("if (window.onNativeMediaAction) window.onNativeMediaAction('$action');")
+                }
             }
         }
         AudioVaultService.onAudioFocusChanged = { isLost ->
             nativeAudioFocusLost = isLost
             activity.runOnUiThread {
                 if (isLost) {
-                    activity.evaluateJs("window.isSystemPaused = true; if (typeof window.setSystemPaused === 'function') window.setSystemPaused(true); if (window.onNativeAudioFocusChanged) window.onNativeAudioFocusChanged(true);")
+                    activity.evaluateJs("window.isSystemInterrupted = true; window.isPlaying = false; window.isSystemPaused = true; if (typeof window.setSystemPaused === 'function') window.setSystemPaused(true); if (window.onNativeAudioFocusChanged) window.onNativeAudioFocusChanged(true);")
                 } else {
-                    activity.evaluateJs("window.isSystemPaused = false; if (typeof window.setSystemPaused === 'function') window.setSystemPaused(false); if (window.onNativeAudioFocusChanged) window.onNativeAudioFocusChanged(false);")
+                    activity.evaluateJs("window.isSystemInterrupted = false; if (window.onNativeAudioFocusChanged) window.onNativeAudioFocusChanged(false);")
                 }
             }
         }
@@ -1120,8 +1128,8 @@ class AndroidBridge(
     }
 
     @JavascriptInterface
-    fun updateMediaMetadata(title: String, artist: String, isPlaying: Boolean, durationMs: Long, positionMs: Long, artUrl: String) {
-        activity.updateServiceMetadata(title, artist, isPlaying, durationMs, positionMs, artUrl)
+    fun updateMediaMetadata(title: String, artist: String, isPlaying: Boolean, durationMs: Long, positionMs: Long, audioPath: String) {
+        activity.updateServiceMetadata(title, artist, isPlaying, durationMs, positionMs, audioPath)
     }
 
     @JavascriptInterface

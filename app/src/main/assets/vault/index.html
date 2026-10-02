@@ -543,8 +543,8 @@
 
         .art-stage {
             position: relative;
-            width: 190px;
-            height: 190px;
+            width: 250px;
+            height: 250px;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -563,7 +563,7 @@
             z-index: 3;
             border-radius: 20px;
             background-color: rgba(255, 255, 255, 0);
-            filter: drop-shadow(0 0 10px rgba(0, 245, 212, 0.55)) drop-shadow(0 0 20px rgba(255, 0, 127, 0.25));
+            filter: drop-shadow(0 0 16px rgba(0, 245, 212, 0.65)) drop-shadow(0 0 28px rgba(255, 0, 127, 0.35));
             transition: filter 0.25s ease, background-color 0.04s ease-out;
         }
 
@@ -1876,7 +1876,7 @@
                 <!-- Hero Section -->
                 <section class="player-hero">
                     <div class="art-stage">
-                        <canvas id="visualizer-canvas" width="190" height="190"></canvas>
+                        <canvas id="visualizer-canvas" width="250" height="250"></canvas>
                         <div id="art-inner" class="art-inner">
                             <img id="cover-art-img" alt="Cover Art" style="display:none;">
                             <div id="cover-art-fallback" class="cover-art-fallback">
@@ -2226,6 +2226,13 @@
             let currentTrackDurationMs = 0;
             let isPlayerViewVisible = false;
 
+            // Strict Global Lock for Audio Focus & System Interruptions (e.g. Mic / Voice Typing)
+            let isSystemInterrupted = false;
+            window.isSystemInterrupted = false;
+            document.addEventListener("visibilitychange", () => {
+                isSystemInterrupted = document.hidden;
+            });
+
             // 3D Spatial Panning Mode: 'atmos', '8d', 'gyro', 'center'
             let spatialMode = 'atmos';
 
@@ -2260,10 +2267,16 @@
                 dynamicR = 0;
                 dynamicG = 245;
                 dynamicB = 212;
+                document.documentElement.style.setProperty('--neon-cyan', 'rgb(0, 245, 212)');
+                document.documentElement.style.setProperty('--dynamic-art-color', 'rgb(0, 245, 212)');
+                document.documentElement.style.setProperty('--dynamic-glow', 'rgba(0, 245, 212, 0.5)');
+                document.documentElement.style.setProperty('--border-neon', 'rgba(0, 245, 212, 0.4)');
+                cachedBarsGrad = null;
             }
 
             function extractDominantColor(imgElement) {
-                if (!imgElement || !imgElement.complete || !imgElement.naturalWidth || imgElement.naturalWidth === 0) {
+                const img = imgElement || document.getElementById('cover-art-img');
+                if (!img || !img.complete || !img.naturalWidth || img.naturalWidth === 0) {
                     resetDynamicColor();
                     return;
                 }
@@ -2279,9 +2292,11 @@
                         return;
                     }
                     hiddenColorCtx.clearRect(0, 0, 48, 48);
-                    hiddenColorCtx.drawImage(imgElement, 0, 0, 48, 48);
+                    hiddenColorCtx.drawImage(img, 0, 0, 48, 48);
                     const imgData = hiddenColorCtx.getImageData(0, 0, 48, 48).data;
                     let rTotal = 0, gTotal = 0, bTotal = 0, count = 0;
+                    let maxSaturation = 0;
+                    let satR = 0, satG = 0, satB = 0;
 
                     for (let i = 0; i < imgData.length; i += 16) {
                         const r = imgData[i];
@@ -2289,22 +2304,44 @@
                         const b = imgData[i + 2];
                         const a = imgData[i + 3];
                         if (a < 128) continue;
+                        const maxVal = Math.max(r, g, b);
+                        const minVal = Math.min(r, g, b);
+                        const delta = maxVal - minVal;
                         const brightness = (r + g + b) / 3;
-                        if (brightness < 20 || brightness > 240) continue;
+                        if (brightness < 18 || brightness > 245) continue;
+
+                        const sat = maxVal > 0 ? (delta / maxVal) : 0;
+                        if (sat > maxSaturation) {
+                            maxSaturation = sat;
+                            satR = r; satG = g; satB = b;
+                        }
+
                         rTotal += r;
                         gTotal += g;
                         bTotal += b;
                         count++;
                     }
 
-                    if (count > 0) {
+                    if (maxSaturation > 0.22) {
+                        let targetR = satR, targetG = satG, targetB = satB;
+                        const maxC = Math.max(targetR, targetG, targetB);
+                        if (maxC < 190 && maxC > 0) {
+                            const mult = 220 / maxC;
+                            targetR = Math.min(255, Math.round(targetR * mult));
+                            targetG = Math.min(255, Math.round(targetG * mult));
+                            targetB = Math.min(255, Math.round(targetB * mult));
+                        }
+                        dynamicR = targetR;
+                        dynamicG = targetG;
+                        dynamicB = targetB;
+                    } else if (count > 0) {
                         let avgR = Math.round(rTotal / count);
                         let avgG = Math.round(gTotal / count);
                         let avgB = Math.round(bTotal / count);
 
                         const maxC = Math.max(avgR, avgG, avgB);
                         if (maxC < 160 && maxC > 0) {
-                            const mult = 185 / maxC;
+                            const mult = 195 / maxC;
                             avgR = Math.min(255, Math.round(avgR * mult));
                             avgG = Math.min(255, Math.round(avgG * mult));
                             avgB = Math.min(255, Math.round(avgB * mult));
@@ -2314,11 +2351,19 @@
                         dynamicB = avgB;
                     } else {
                         resetDynamicColor();
+                        return;
                     }
+
+                    document.documentElement.style.setProperty('--neon-cyan', `rgb(${dynamicR}, ${dynamicG}, ${dynamicB})`);
+                    document.documentElement.style.setProperty('--dynamic-art-color', `rgb(${dynamicR}, ${dynamicG}, ${dynamicB})`);
+                    document.documentElement.style.setProperty('--dynamic-glow', `rgba(${dynamicR}, ${dynamicG}, ${dynamicB}, 0.5)`);
+                    document.documentElement.style.setProperty('--border-neon', `rgba(${dynamicR}, ${dynamicG}, ${dynamicB}, 0.45)`);
+                    cachedBarsGrad = null;
                 } catch (_) {
                     resetDynamicColor();
                 }
             }
+            window.extractDominantColor = extractDominantColor;
 
             const trackListView = document.getElementById('playlist');
             const toastEl = document.getElementById('toast');
@@ -3514,11 +3559,25 @@
 
             function drawIdleCanvas() {
                 if (!canvasCtx || !canvas) return;
+                const dpr = window.devicePixelRatio || 1;
+                const clientW = canvas.clientWidth || 250;
+                const clientH = canvas.clientHeight || 250;
+                const targetW = Math.round(clientW * dpr);
+                const targetH = Math.round(clientH * dpr);
+
+                if (canvas.width !== targetW || canvas.height !== targetH) {
+                    canvas.width = targetW;
+                    canvas.height = targetH;
+                }
+
+                canvasCtx.setTransform(1, 0, 0, 1, 0, 0);
                 canvasCtx.globalCompositeOperation = 'source-over';
                 canvasCtx.globalAlpha = 1.0;
                 canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
-                const cx = canvas.width / 2;
-                const cy = canvas.height / 2;
+
+                canvasCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                const cx = clientW / 2;
+                const cy = clientH / 2;
                 drawSpecificIdlePattern(visualizerPattern, 1.0, cx, cy);
             }
 
@@ -3529,121 +3588,85 @@
                 canvasCtx.globalAlpha = alpha;
                 canvasCtx.shadowBlur = 0;
 
+                const r = dynamicR;
+                const g = dynamicG;
+                const b = dynamicB;
+
                 if (pattern === 'zenox-adaptive') {
-                    const baseRadius = 72;
-                    const r = dynamicR;
-                    const g = dynamicG;
-                    const b = dynamicB;
-
-                    // Idle Wireframe Polygon (36 nodes)
-                    const nodeCount = 36;
+                    const baseRadius = 78;
+                    // Razor-sharp glowing Crimson/Red wireframe ring (#FF003C)
                     canvasCtx.beginPath();
-                    for (let i = 0; i <= nodeCount; i++) {
-                        const angle = -Math.PI / 2 + (i * Math.PI * 2) / nodeCount;
-                        const px = cx + Math.cos(angle) * baseRadius;
-                        const py = cy + Math.sin(angle) * baseRadius;
-                        if (i === 0) canvasCtx.moveTo(px, py);
-                        else canvasCtx.lineTo(px, py);
-                    }
-                    canvasCtx.closePath();
-                    canvasCtx.strokeStyle = `rgba(${r}, ${g}, ${b}, 0.28)`;
-                    canvasCtx.lineWidth = 3.6;
-                    canvasCtx.stroke();
-                    canvasCtx.strokeStyle = `rgb(${r}, ${g}, ${b})`;
-                    canvasCtx.lineWidth = 1.8;
+                    canvasCtx.arc(cx, cy, baseRadius, 0, Math.PI * 2);
+                    canvasCtx.strokeStyle = 'rgba(255, 0, 60, 0.35)';
+                    canvasCtx.lineWidth = 4.0;
                     canvasCtx.stroke();
 
-                    // Idle concentric inner diamond
-                    const innerR = baseRadius * 0.7;
                     canvasCtx.beginPath();
-                    for (let h = 0; h <= 8; h++) {
-                        const hAngle = (h * Math.PI * 2) / 8;
-                        const hx = cx + Math.cos(hAngle) * innerR;
-                        const hy = cy + Math.sin(hAngle) * innerR;
-                        if (h === 0) canvasCtx.moveTo(hx, hy);
-                        else canvasCtx.lineTo(hx, hy);
-                    }
-                    canvasCtx.closePath();
-                    canvasCtx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
-                    canvasCtx.lineWidth = 1.2;
+                    canvasCtx.arc(cx, cy, baseRadius, 0, Math.PI * 2);
+                    canvasCtx.strokeStyle = '#FF003C';
+                    canvasCtx.lineWidth = 1.6;
                     canvasCtx.stroke();
 
-                    // Subtle radial nodes
-                    for (let i = 0; i < nodeCount; i += 2) {
-                        const angle = -Math.PI / 2 + (i * Math.PI * 2) / nodeCount;
-                        const cosA = Math.cos(angle);
-                        const sinA = Math.sin(angle);
-                        canvasCtx.beginPath();
-                        canvasCtx.moveTo(cx + cosA * (baseRadius - 2), cy + sinA * (baseRadius - 2));
-                        canvasCtx.lineTo(cx + cosA * (baseRadius + 5), cy + sinA * (baseRadius + 5));
-                        canvasCtx.strokeStyle = `rgba(${r}, ${g}, ${b}, 0.5)`;
-                        canvasCtx.lineWidth = 1.4;
-                        canvasCtx.stroke();
-                    }
+                    // Ensure album art center square is 100% clean
+                    const innerSize = 146;
+                    canvasCtx.clearRect(cx - innerSize / 2, cy - innerSize / 2, innerSize, innerSize);
                 } else if (pattern === 'circular') {
-                    // Pulsing neon circular idle spectrum with 32 radial tick bars
                     const baseRadius = 72;
-                    // Outer aura ring
                     canvasCtx.beginPath();
                     canvasCtx.arc(cx, cy, baseRadius, 0, Math.PI * 2);
-                    canvasCtx.strokeStyle = 'rgba(0, 245, 212, 0.25)';
+                    canvasCtx.strokeStyle = `rgba(${r}, ${g}, ${b}, 0.25)`;
                     canvasCtx.lineWidth = 3.6;
                     canvasCtx.stroke();
 
-                    // Inner bright core ring
                     canvasCtx.beginPath();
                     canvasCtx.arc(cx, cy, baseRadius, 0, Math.PI * 2);
-                    canvasCtx.strokeStyle = 'rgba(0, 245, 212, 0.75)';
+                    canvasCtx.strokeStyle = `rgb(${r}, ${g}, ${b})`;
                     canvasCtx.lineWidth = 1.8;
                     canvasCtx.stroke();
 
                     const idleBars = 32;
                     const step = (Math.PI * 2) / idleBars;
-                    const cyanPath = new Path2D();
-                    const magPath = new Path2D();
+                    const auraPath = new Path2D();
 
                     for (let i = 0; i < idleBars; i++) {
                         const angle = -Math.PI / 2 + i * step;
                         const cosA = Math.cos(angle);
                         const sinA = Math.sin(angle);
                         const h = 4.5 + Math.sin(i * 0.5) * 2.5;
-                        const colorRatio = (sinA + 1) / 2;
-                        const targetPath = colorRatio > 0.5 ? magPath : cyanPath;
-                        targetPath.moveTo(cx + cosA * (baseRadius + 1), cy + sinA * (baseRadius + 1));
-                        targetPath.lineTo(cx + cosA * (baseRadius + 1 + h), cy + sinA * (baseRadius + 1 + h));
+                        auraPath.moveTo(cx + cosA * (baseRadius + 1), cy + sinA * (baseRadius + 1));
+                        auraPath.lineTo(cx + cosA * (baseRadius + 1 + h), cy + sinA * (baseRadius + 1 + h));
                     }
 
                     canvasCtx.lineWidth = 2.4;
                     canvasCtx.lineCap = 'round';
-                    canvasCtx.strokeStyle = 'rgba(0, 245, 212, 0.75)';
-                    canvasCtx.stroke(cyanPath);
-                    canvasCtx.strokeStyle = 'rgba(255, 0, 127, 0.75)';
-                    canvasCtx.stroke(magPath);
+                    canvasCtx.strokeStyle = `rgb(${r}, ${g}, ${b})`;
+                    canvasCtx.stroke(auraPath);
                 } else if (pattern === 'waveform') {
                     const wavePath = new Path2D();
+                    const canvasW = cx * 2;
                     wavePath.moveTo(10, cy);
-                    for (let x = 10; x <= canvas.width - 10; x += 5) {
-                        const y = cy + Math.sin((x / canvas.width) * Math.PI * 4) * 3;
+                    for (let x = 10; x <= canvasW - 10; x += 5) {
+                        const y = cy + Math.sin((x / canvasW) * Math.PI * 4) * 3;
                         wavePath.lineTo(x, y);
                     }
-                    // Outer aura
-                    canvasCtx.strokeStyle = 'rgba(0, 245, 212, 0.25)';
+                    canvasCtx.strokeStyle = `rgba(${r}, ${g}, ${b}, 0.25)`;
                     canvasCtx.lineWidth = 3.5;
                     canvasCtx.stroke(wavePath);
-                    // Core
-                    canvasCtx.strokeStyle = '#00F5D4';
+                    canvasCtx.strokeStyle = `rgb(${r}, ${g}, ${b})`;
                     canvasCtx.lineWidth = 1.5;
                     canvasCtx.stroke(wavePath);
                 } else if (pattern === 'bars') {
+                    const w = cx * 2;
+                    const h = cy * 2;
                     const barCount = 24;
                     const padding = 8;
-                    const totalBarSpace = (canvas.width || 190) - (padding * 2);
+                    const totalBarSpace = w - (padding * 2);
                     const spacing = 2.5;
                     const barWidth = Math.max(2, (totalBarSpace - (barCount - 1) * spacing) / barCount);
-                    canvasCtx.fillStyle = 'rgba(0, 245, 212, 0.45)';
+                    canvasCtx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.45)`;
                     for (let i = 0; i < barCount; i++) {
                         const bx = padding + i * (barWidth + spacing);
-                        canvasCtx.fillRect(bx, (canvas.height || 190) - 16, barWidth, 4);
+                        canvasCtx.fillRect(bx, h - 16, barWidth, 4);
                     }
                 }
                 canvasCtx.restore();
@@ -3655,33 +3678,34 @@
                 canvasCtx.globalAlpha = alpha;
                 canvasCtx.shadowBlur = 0;
 
+                const r = dynamicR;
+                const g = dynamicG;
+                const b = dynamicB;
+
                 // Dynamic pulsing base radius that expands on hard bass hits
                 const baseRadius = 72 + (isPlaying ? smoothedBass * 5.0 : 0);
                 const barCount = 48;
                 const angleStep = (Math.PI * 2) / barCount;
                 const maxBarLen = 26;
 
-                // 1. Glowing baseline circular core (hardware-accelerated dual stroke)
+                // 1. Glowing baseline circular core
                 canvasCtx.beginPath();
                 canvasCtx.arc(cx, cy, baseRadius, 0, Math.PI * 2);
                 canvasCtx.lineWidth = 3.8;
-                canvasCtx.strokeStyle = 'rgba(0, 245, 212, 0.22)';
+                canvasCtx.strokeStyle = `rgba(${r}, ${g}, ${b}, 0.25)`;
                 canvasCtx.stroke();
 
                 canvasCtx.beginPath();
                 canvasCtx.arc(cx, cy, baseRadius, 0, Math.PI * 2);
                 canvasCtx.lineWidth = 1.8;
-                canvasCtx.strokeStyle = 'rgba(0, 245, 212, 0.85)';
+                canvasCtx.strokeStyle = `rgb(${r}, ${g}, ${b})`;
                 canvasCtx.stroke();
 
-                // 2. High-Octane Radial Spectrum Bars (Ultra-fast batched Path2D draw calls)
-                const cyanAura = new Path2D();
-                const magAura = new Path2D();
-                const cyanCore = new Path2D();
-                const magCore = new Path2D();
+                // 2. High-Octane Radial Spectrum Bars
+                const auraPath = new Path2D();
+                const corePath = new Path2D();
                 const whiteHighlights = new Path2D();
-                const cyanDots = new Path2D();
-                const magDots = new Path2D();
+                const dotsPath = new Path2D();
 
                 const bridge = window.AudioEngineBridge;
 
@@ -3700,7 +3724,6 @@
                         }
                     }
 
-                    // Dynamic response (punchy low end, sparkling treble)
                     const isBassZone = normIdx < 0.25;
                     const isTrebleZone = normIdx > 0.7;
                     let boostedMag = Math.pow(rawMag, 1.2);
@@ -3709,7 +3732,6 @@
 
                     const barLen = isPlaying && boostedMag > 0.02 ? Math.max(3.0, boostedMag * maxBarLen) : 0;
 
-                    // Peak cap tracking & gravity decay
                     if (!isPlaying || barLen <= 0) {
                         circularPeakCaps[i] = Math.max(0, (circularPeakCaps[i] || 0) * 0.88);
                     } else if (barLen > circularPeakCaps[i]) {
@@ -3727,65 +3749,49 @@
                     const x2 = cx + cosA * (baseRadius + barLen);
                     const y2 = cy + sinA * (baseRadius + barLen);
 
-                    const colorRatio = (sinA + 1) / 2;
-                    const isMag = colorRatio > 0.5;
-
-                    // Batch into aura and core paths
                     if (barLen > 0) {
-                        const auraPath = isMag ? magAura : cyanAura;
-                        const corePath = isMag ? magCore : cyanCore;
                         auraPath.moveTo(x1, y1);
                         auraPath.lineTo(x2, y2);
                         corePath.moveTo(x1, y1);
                         corePath.lineTo(x2, y2);
 
-                        // White-hot core highlight on hard transients
                         if (boostedMag > 0.4) {
                             whiteHighlights.moveTo(x1, y1);
                             whiteHighlights.lineTo(cx + cosA * (baseRadius + barLen * 0.75), cy + sinA * (baseRadius + barLen * 0.75));
                         }
                     }
 
-                    // Floating neon peak cap dot
                     if (circularPeakCaps[i] > 1.0) {
                         const capDist = baseRadius + circularPeakCaps[i] + 3.5;
                         const capX = cx + cosA * capDist;
                         const capY = cy + sinA * capDist;
-                        const dotPath = isMag ? magDots : cyanDots;
-                        dotPath.moveTo(capX + 1.4, capY);
-                        dotPath.arc(capX, capY, 1.4, 0, Math.PI * 2);
+                        dotsPath.moveTo(capX + 1.4, capY);
+                        dotsPath.arc(capX, capY, 1.4, 0, Math.PI * 2);
                     }
                 }
 
-                // Execute high-speed batched rasterization (only 7 draw calls for entire ring)
                 canvasCtx.lineCap = 'round';
 
-                // Outer neon optical auras
+                // Outer neon optical aura
                 canvasCtx.lineWidth = 4.8;
-                canvasCtx.strokeStyle = 'rgba(0, 245, 212, 0.32)';
-                canvasCtx.stroke(cyanAura);
-                canvasCtx.strokeStyle = 'rgba(255, 0, 127, 0.32)';
-                canvasCtx.stroke(magAura);
+                canvasCtx.strokeStyle = `rgba(${r}, ${g}, ${b}, 0.32)`;
+                canvasCtx.stroke(auraPath);
 
-                // Sharp cores
+                // Sharp core
                 canvasCtx.lineWidth = 2.2;
-                canvasCtx.strokeStyle = '#00F5D4';
-                canvasCtx.stroke(cyanCore);
-                canvasCtx.strokeStyle = '#FF007F';
-                canvasCtx.stroke(magCore);
+                canvasCtx.strokeStyle = `rgb(${r}, ${g}, ${b})`;
+                canvasCtx.stroke(corePath);
 
-                // White-hot transient highlights
+                // White-hot highlights
                 canvasCtx.lineWidth = 1.2;
                 canvasCtx.strokeStyle = '#FFFFFF';
                 canvasCtx.stroke(whiteHighlights);
 
                 // Peak cap dots
-                canvasCtx.fillStyle = '#00F5D4';
-                canvasCtx.fill(cyanDots);
-                canvasCtx.fillStyle = '#FF007F';
-                canvasCtx.fill(magDots);
+                canvasCtx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+                canvasCtx.fill(dotsPath);
 
-                // 3. Electric perimeter aura connecting peaks on high energy
+                // Electric perimeter connecting peaks on high energy
                 if (isPlaying && smoothedBass > 0.4) {
                     canvasCtx.beginPath();
                     for (let i = 0; i <= barCount; i++) {
@@ -3799,7 +3805,7 @@
                     }
                     canvasCtx.closePath();
                     canvasCtx.lineWidth = 1.4;
-                    canvasCtx.strokeStyle = `rgba(0, 245, 212, ${(smoothedBass * 0.5).toFixed(3)})`;
+                    canvasCtx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${(smoothedBass * 0.5).toFixed(3)})`;
                     canvasCtx.stroke();
                 }
 
@@ -3811,13 +3817,17 @@
                 canvasCtx.save();
                 canvasCtx.globalAlpha = alpha;
                 const points = 30;
-                const step = (canvas.width - 20) / points;
+                const canvasW = cx * 2;
+                const step = (canvasW - 20) / points;
                 canvasCtx.lineCap = 'round';
 
+                const r = dynamicR;
+                const g = dynamicG;
+                const b = dynamicB;
                 const bridge = window.AudioEngineBridge;
 
-                // Primary Cyan Neon Wave (strictly maps to real spectrum and smoothedBass)
-                const cyanPts = [];
+                // Primary Neon Wave
+                const pts = [];
                 for (let i = 0; i <= points; i++) {
                     const x = 10 + i * step;
                     let fVal = 0;
@@ -3834,60 +3844,23 @@
                     const amp = isPlaying ? (fVal * 36 + smoothedBass * 14) : 0;
                     const wave = amp > 0.01 ? Math.sin((i / points) * Math.PI * 4) * amp : 0;
                     const y = cy + wave;
-                    cyanPts.push({ x, y });
+                    pts.push({ x, y });
                 }
 
                 // Outer optical aura
                 canvasCtx.beginPath();
-                canvasCtx.strokeStyle = 'rgba(0, 245, 212, 0.35)';
+                canvasCtx.strokeStyle = `rgba(${r}, ${g}, ${b}, 0.35)`;
                 canvasCtx.lineWidth = 5.6;
-                canvasCtx.moveTo(cyanPts[0].x, cyanPts[0].y);
-                for (let i = 1; i < cyanPts.length; i++) canvasCtx.lineTo(cyanPts[i].x, cyanPts[i].y);
+                canvasCtx.moveTo(pts[0].x, pts[0].y);
+                for (let i = 1; i < pts.length; i++) canvasCtx.lineTo(pts[i].x, pts[i].y);
                 canvasCtx.stroke();
 
                 // Bright core
                 canvasCtx.beginPath();
-                canvasCtx.strokeStyle = '#00F5D4';
+                canvasCtx.strokeStyle = `rgb(${r}, ${g}, ${b})`;
                 canvasCtx.lineWidth = 2.4;
-                canvasCtx.moveTo(cyanPts[0].x, cyanPts[0].y);
-                for (let i = 1; i < cyanPts.length; i++) canvasCtx.lineTo(cyanPts[i].x, cyanPts[i].y);
-                canvasCtx.stroke();
-
-                // Secondary Magenta Harmonized Wave
-                const magPts = [];
-                for (let i = 0; i <= points; i++) {
-                    const x = 10 + i * step;
-                    let fVal = 0;
-                    if (isPlaying) {
-                        if (bridge && bridge.smoothedSpectrum) {
-                            const bin = Math.min(bridge.spectrumSize - 1, Math.floor(((points - i) / points) * (bridge.spectrumSize - 1)));
-                            fVal = (bridge.smoothedSpectrum[bin] || 0) / 255.0;
-                        } else if (freqData && freqData.length > 0) {
-                            fVal = (freqData[(i + 4) % freqData.length] || 0) / 255.0;
-                        } else {
-                            fVal = smoothedBass;
-                        }
-                    }
-                    const amp = isPlaying ? (fVal * 28 + smoothedBass * 10) : 0;
-                    const wave = amp > 0.01 ? Math.cos((i / points) * Math.PI * 3) * amp : 0;
-                    const y = cy + wave;
-                    magPts.push({ x, y });
-                }
-
-                // Outer optical aura
-                canvasCtx.beginPath();
-                canvasCtx.strokeStyle = 'rgba(255, 0, 127, 0.35)';
-                canvasCtx.lineWidth = 5.0;
-                canvasCtx.moveTo(magPts[0].x, magPts[0].y);
-                for (let i = 1; i < magPts.length; i++) canvasCtx.lineTo(magPts[i].x, magPts[i].y);
-                canvasCtx.stroke();
-
-                // Bright core
-                canvasCtx.beginPath();
-                canvasCtx.strokeStyle = '#FF007F';
-                canvasCtx.lineWidth = 2.0;
-                canvasCtx.moveTo(magPts[0].x, magPts[0].y);
-                for (let i = 1; i < magPts.length; i++) canvasCtx.lineTo(magPts[i].x, magPts[i].y);
+                canvasCtx.moveTo(pts[0].x, pts[0].y);
+                for (let i = 1; i < pts.length; i++) canvasCtx.lineTo(pts[i].x, pts[i].y);
                 canvasCtx.stroke();
 
                 canvasCtx.restore();
@@ -3901,8 +3874,12 @@
                 canvasCtx.save();
                 canvasCtx.globalAlpha = alpha;
 
-                const w = (canvas && canvas.width) ? canvas.width : 190;
-                const h = (canvas && canvas.height) ? canvas.height : 190;
+                const r = dynamicR;
+                const g = dynamicG;
+                const b = dynamicB;
+
+                const w = cx * 2;
+                const h = cy * 2;
                 const barCount = 24;
                 const padding = 8;
                 const totalBarSpace = w - (padding * 2);
@@ -3911,12 +3888,11 @@
                 const baseY = h - 14;
                 const maxBarH = h - 28;
 
-                // Cached vertical gradient to eliminate GC allocation
                 if (!cachedBarsGrad || cachedBarsBaseY !== baseY) {
                     cachedBarsGrad = canvasCtx.createLinearGradient(0, baseY, 0, baseY - maxBarH);
-                    cachedBarsGrad.addColorStop(0, '#00F5D4');
-                    cachedBarsGrad.addColorStop(0.5, '#8A2BE2');
-                    cachedBarsGrad.addColorStop(1, '#FF007F');
+                    cachedBarsGrad.addColorStop(0, `rgb(${r}, ${g}, ${b})`);
+                    cachedBarsGrad.addColorStop(0.5, `rgba(${r}, ${g}, ${b}, 0.65)`);
+                    cachedBarsGrad.addColorStop(1, '#FFFFFF');
                     cachedBarsBaseY = baseY;
                 }
 
@@ -3937,7 +3913,6 @@
                         }
                     }
 
-                    // Dynamic response so bars across the spectrum dance actively
                     const normI = i / barCount;
                     const freqWeight = 1.0 + Math.pow(normI, 0.7) * 2.2;
                     let boostedMag = mag * freqWeight;
@@ -3952,11 +3927,9 @@
                         : (isPlaying ? 4 : 2);
                     const by = baseY - barHeight;
 
-                    // Bar column with vertical gradient
                     canvasCtx.fillStyle = cachedBarsGrad;
                     canvasCtx.fillRect(bx, by, barWidth, barHeight);
 
-                    // White-hot peak cap when active
                     if (isPlaying && boostedMag > 0.06) {
                         canvasCtx.fillStyle = '#FFFFFF';
                         canvasCtx.fillRect(bx, by - 2, barWidth, 1.5);
@@ -3966,175 +3939,119 @@
             }
 
             // =========================================================================
-            // TASK 3: "ZENOX ADAPTIVE" VISUALIZER PATTERN (DYNAMIC WIREFRAME & NODES)
+            // ZENOX ADAPTIVE VISUALIZER: BLINDING NEON FIRE & EXPONENTIAL AUDIO SYNC
             // =========================================================================
-            const zenoxParticles = [];
-            for (let p = 0; p < 42; p++) {
-                zenoxParticles.push({
-                    angle: Math.random() * Math.PI * 2,
-                    dist: 55 + Math.random() * 35,
-                    speed: 0.8 + Math.random() * 2.2,
-                    size: 1.0 + Math.random() * 2.4,
-                    alpha: 0.3 + Math.random() * 0.7
-                });
-            }
-
             function renderZenoxAdaptivePattern(alpha, currentNow, cx, cy, glowIntensity, smoothedBass) {
-                if (alpha <= 0.001 || !canvasCtx) return;
+                if (alpha <= 0.001 || !canvasCtx || !canvas) return;
+
+                // Ensure clean canvas frame clearance to prevent DOM trails
                 canvasCtx.save();
+                canvasCtx.globalCompositeOperation = 'source-over';
                 canvasCtx.globalAlpha = alpha;
 
-                const nodeCount = 36;
-                const angleStep = (Math.PI * 2) / nodeCount;
-                const baseRadius = 66 + smoothedBass * 18;
-                const maxExplosion = 46 + smoothedBass * 38;
-
-                const r = dynamicR;
-                const g = dynamicG;
-                const b = dynamicB;
-
-                const wirePoints = [];
-                const nodePoints = [];
+                // STRICT AUDIO SYNC: Tied 100% to actual audio data. If music is paused or silent, 100% still.
                 const bridge = window.AudioEngineBridge;
+                const peakEnergy = (bridge && typeof bridge.peakEnergy === 'number') ? bridge.peakEnergy : smoothedBass;
+                const isSilent = !isPlaying || (smoothedBass < 0.01 && peakEnergy < 0.01);
 
-                for (let i = 0; i < nodeCount; i++) {
-                    const angle = -Math.PI / 2 + i * angleStep;
-                    const cosA = Math.cos(angle);
-                    const sinA = Math.sin(angle);
+                // Album art .art-inner is 145px × 145px (half-size = 72.5px).
+                // Base radius: when silent, instantly snaps back to a perfect still circle (78px).
+                const baseRingRadius = 78;
+                const ringRadius = isSilent ? baseRingRadius : (baseRingRadius + Math.pow(smoothedBass, 2) * 16);
 
-                    let rawMag = 0;
-                    if (isPlaying) {
-                        if (bridge && bridge.smoothedSpectrum) {
-                            const bin = Math.min(bridge.spectrumSize - 1, Math.floor((i / nodeCount) * bridge.spectrumSize));
-                            rawMag = (bridge.smoothedSpectrum[bin] || 0) / 255.0;
+                // Extreme Blinding Neon Fire Glow Effect
+                const blurAmount = isSilent ? 12 : (30 + (peakEnergy * 50));
+                canvasCtx.shadowBlur = blurAmount;
+                canvasCtx.shadowColor = '#FF003C';
+
+                // 1. Thick Glowing Crimson/Red Wireframe Ring (#FF003C)
+                const ringLineWidth = isSilent ? 3.0 : (4 + (smoothedBass * 6));
+                canvasCtx.beginPath();
+                canvasCtx.arc(cx, cy, ringRadius, 0, Math.PI * 2);
+                canvasCtx.lineWidth = ringLineWidth;
+                canvasCtx.strokeStyle = '#FF003C';
+                canvasCtx.stroke();
+
+                // High-transient white-hot sheen on intense peak hits
+                if (!isSilent && peakEnergy > 0.45) {
+                    const whiteIntensity = Math.min(1.0, (peakEnergy - 0.45) / 0.55);
+                    canvasCtx.beginPath();
+                    canvasCtx.arc(cx, cy, ringRadius, 0, Math.PI * 2);
+                    canvasCtx.lineWidth = Math.max(1.5, ringLineWidth * 0.35);
+                    canvasCtx.strokeStyle = `rgba(255, 255, 255, ${(whiteIntensity * 0.95 * alpha).toFixed(2)})`;
+                    canvasCtx.stroke();
+                }
+
+                // 2. Exponential Audio Reactivity: Explosive Blazing Zenox Sparks Shooting Outward
+                if (!isSilent && (smoothedBass > 0.03 || peakEnergy > 0.1)) {
+                    const rayCount = 56;
+                    const angleStep = (Math.PI * 2) / rayCount;
+                    const sparkLineWidth = 4 + (smoothedBass * 6);
+
+                    for (let i = 0; i < rayCount; i++) {
+                        const angle = i * angleStep;
+                        const cosA = Math.cos(angle);
+                        const sinA = Math.sin(angle);
+
+                        // Frequency spectrum sampling
+                        let fVal = 0;
+                        if (bridge && bridge.smoothedSpectrum && bridge.smoothedSpectrum.length > 0) {
+                            const bin = Math.min(bridge.spectrumSize - 1, Math.floor((i / rayCount) * bridge.spectrumSize));
+                            fVal = (bridge.smoothedSpectrum[bin] || 0) / 255.0;
                         } else if (freqData && freqData.length > 0) {
-                            rawMag = (freqData[i % freqData.length] || 0) / 255.0;
-                        } else {
-                            rawMag = smoothedBass;
+                            fVal = (freqData[i % freqData.length] || 0) / 255.0;
                         }
-                    }
 
-                    // Violent explosive projection strictly mapped to smoothedBass and audio frequency
-                    const explosiveKick = Math.pow(rawMag, 1.3) * maxExplosion + Math.pow(smoothedBass, 2.5) * 26;
-                    const innerRadius = baseRadius;
-                    const outerRadius = baseRadius + (isPlaying ? explosiveKick : 2);
+                        // EXPONENTIAL math for audio reactivity
+                        const combinedEnergy = Math.max(smoothedBass, fVal * 0.7 + smoothedBass * 0.45);
+                        let barLength = Math.max(5, Math.pow(combinedEnergy, 3) * 200);
 
-                    wirePoints.push({
-                        x: cx + cosA * innerRadius,
-                        y: cy + sinA * innerRadius
-                    });
+                        // Massive beat drop transients when peakEnergy hits
+                        if (peakEnergy > 0.28) {
+                            const peakBurst = Math.pow(peakEnergy, 2.5) * 95;
+                            const emphasis = ((i * 7) % 3 === 0 || (i * 11) % 4 === 0) ? 1.55 : 0.85;
+                            barLength += peakBurst * emphasis;
+                        }
 
-                    nodePoints.push({
-                        x1: cx + cosA * innerRadius,
-                        y1: cy + sinA * innerRadius,
-                        x2: cx + cosA * outerRadius,
-                        y2: cy + sinA * outerRadius,
-                        mag: rawMag,
-                        angle: angle,
-                        outerRadius: outerRadius
-                    });
-                }
+                        const startX = cx + cosA * (ringRadius + 1);
+                        const startY = cy + sinA * (ringRadius + 1);
+                        const endX = cx + cosA * (ringRadius + 1 + barLength);
+                        const endY = cy + sinA * (ringRadius + 1 + barLength);
 
-                // Dynamic background aura using extracted album art colors
-                const auraGradient = canvasCtx.createRadialGradient(cx, cy, baseRadius * 0.4, cx, cy, baseRadius + maxExplosion * 1.25);
-                auraGradient.addColorStop(0, `rgba(${r}, ${g}, ${b}, ${(0.24 * alpha + smoothedBass * 0.26).toFixed(3)})`);
-                auraGradient.addColorStop(0.65, `rgba(${r}, ${g}, ${b}, ${(0.08 * alpha).toFixed(3)})`);
-                auraGradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
-                canvasCtx.fillStyle = auraGradient;
-                canvasCtx.beginPath();
-                canvasCtx.arc(cx, cy, baseRadius + maxExplosion * 1.25, 0, Math.PI * 2);
-                canvasCtx.fill();
-
-                // Outer Wireframe Polygon connecting node bases
-                canvasCtx.beginPath();
-                for (let i = 0; i <= nodeCount; i++) {
-                    const pt = wirePoints[i % nodeCount];
-                    if (i === 0) canvasCtx.moveTo(pt.x, pt.y);
-                    else canvasCtx.lineTo(pt.x, pt.y);
-                }
-                canvasCtx.closePath();
-                // Outer glow
-                canvasCtx.lineWidth = 4.6;
-                canvasCtx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${(0.38 * alpha).toFixed(3)})`;
-                canvasCtx.stroke();
-                // Sharp inner wireframe line
-                canvasCtx.lineWidth = 2.0;
-                canvasCtx.strokeStyle = `rgb(${r}, ${g}, ${b})`;
-                canvasCtx.stroke();
-
-                // Counter-Rotating Inner Faceted Diamond Wireframe
-                const rot = (currentNow * 0.0014);
-                canvasCtx.beginPath();
-                const hexNodes = 8;
-                const innerHexRadius = baseRadius * (0.68 + smoothedBass * 0.16);
-                for (let h = 0; h <= hexNodes; h++) {
-                    const hAngle = rot + (h * Math.PI * 2) / hexNodes;
-                    const hx = cx + Math.cos(hAngle) * innerHexRadius;
-                    const hy = cy + Math.sin(hAngle) * innerHexRadius;
-                    if (h === 0) canvasCtx.moveTo(hx, hy);
-                    else canvasCtx.lineTo(hx, hy);
-                }
-                canvasCtx.closePath();
-                canvasCtx.lineWidth = 1.4;
-                canvasCtx.strokeStyle = `rgba(255, 255, 255, ${(0.6 * alpha).toFixed(2)})`;
-                canvasCtx.stroke();
-
-                // Exploding Node Spikes violently shooting outward
-                canvasCtx.lineCap = 'round';
-                for (const node of nodePoints) {
-                    if (node.outerRadius <= baseRadius + 1) continue;
-
-                    // Neon Aura spike
-                    canvasCtx.beginPath();
-                    canvasCtx.lineWidth = 4.2;
-                    canvasCtx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${(0.35 * alpha).toFixed(3)})`;
-                    canvasCtx.moveTo(node.x1, node.y1);
-                    canvasCtx.lineTo(node.x2, node.y2);
-                    canvasCtx.stroke();
-
-                    // Sharp core spike
-                    canvasCtx.beginPath();
-                    canvasCtx.lineWidth = 1.8;
-                    canvasCtx.strokeStyle = `rgb(${r}, ${g}, ${b})`;
-                    canvasCtx.moveTo(node.x1, node.y1);
-                    canvasCtx.lineTo(node.x2, node.y2);
-                    canvasCtx.stroke();
-
-                    // White-hot tip burst on violent transients
-                    if (node.mag > 0.35 || smoothedBass > 0.6) {
+                        // Blazing Crimson Neon Fire Ray
                         canvasCtx.beginPath();
-                        canvasCtx.lineWidth = 1.2;
-                        canvasCtx.strokeStyle = '#FFFFFF';
-                        canvasCtx.moveTo(node.x1 + (node.x2 - node.x1) * 0.65, node.y1 + (node.y2 - node.y1) * 0.65);
-                        canvasCtx.lineTo(node.x2, node.y2);
+                        canvasCtx.moveTo(startX, startY);
+                        canvasCtx.lineTo(endX, endY);
+                        canvasCtx.lineWidth = sparkLineWidth;
+                        canvasCtx.strokeStyle = `rgba(255, 0, 60, ${(0.92 * alpha).toFixed(2)})`;
                         canvasCtx.stroke();
 
-                        // Glowing node particle point at tip
-                        canvasCtx.beginPath();
-                        canvasCtx.arc(node.x2, node.y2, 1.8 + smoothedBass * 1.5, 0, Math.PI * 2);
-                        canvasCtx.fillStyle = '#FFFFFF';
-                        canvasCtx.fill();
-                    }
-                }
-
-                // Dynamic Particles exploding outward on heavy bass
-                if (isPlaying && smoothedBass > 0.38) {
-                    for (let p = 0; p < zenoxParticles.length; p++) {
-                        const pt = zenoxParticles[p];
-                        pt.dist += pt.speed * (1.2 + smoothedBass * 4.2);
-                        if (pt.dist > baseRadius + maxExplosion * 1.4) {
-                            pt.dist = baseRadius + 2;
-                            pt.angle = Math.random() * Math.PI * 2;
+                        // Blinding White/Yellow Core Streak
+                        if (barLength > 12) {
+                            canvasCtx.beginPath();
+                            canvasCtx.moveTo(startX + cosA * 3, startY + sinA * 3);
+                            canvasCtx.lineTo(endX, endY);
+                            canvasCtx.lineWidth = Math.max(1.4, sparkLineWidth * 0.4);
+                            canvasCtx.strokeStyle = combinedEnergy > 0.5 ? '#FFFFFF' : 'rgba(255, 200, 80, 0.95)';
+                            canvasCtx.stroke();
                         }
-                        const px = cx + Math.cos(pt.angle) * pt.dist;
-                        const py = cy + Math.sin(pt.angle) * pt.dist;
 
-                        canvasCtx.beginPath();
-                        canvasCtx.arc(px, py, pt.size, 0, Math.PI * 2);
-                        canvasCtx.fillStyle = `rgba(${r}, ${g}, ${b}, ${(pt.alpha * alpha).toFixed(3)})`;
-                        canvasCtx.fill();
+                        // Blinding Spark Needle Tip
+                        if (barLength > 18) {
+                            canvasCtx.beginPath();
+                            canvasCtx.arc(endX, endY, 1.6 + (peakEnergy * 1.5), 0, Math.PI * 2);
+                            canvasCtx.fillStyle = combinedEnergy > 0.6 ? '#FFFFFF' : '#FF003C';
+                            canvasCtx.fill();
+                        }
                     }
                 }
+
+                // Reset shadow blur before clearing center square
+                canvasCtx.shadowBlur = 0;
+
+                // 3. Ensure NO drawing happens inside the center square (leave the album art area perfectly clean)
+                const centerSquareSize = 146;
+                canvasCtx.clearRect(cx - centerSquareSize / 2, cy - centerSquareSize / 2, centerSquareSize, centerSquareSize);
 
                 canvasCtx.restore();
             }
@@ -4194,36 +4111,36 @@
 
                 pollAnalyzer(now) {
                     if (!isPlaying) return;
-                    // FIX 3: Stop parsing audio visualizer data completely if not actively in view-player
+                    // Stop polling if not actively viewing the player
                     const playerViewEl = document.getElementById('view-player');
                     const isPlayerVisible = isPlayerViewVisible && (playerViewEl ? (playerViewEl.style.display !== 'none' && playerViewEl.offsetParent !== null) : true);
                     if (!isPlayerVisible) return;
 
                     const currentNow = now || performance.now();
-                    // Throttle polling aggressively to ~16 FPS (60ms) to free up CPU and eliminate button input lag
-                    if (currentNow - this.lastFetch >= 60) {
-                        this.lastFetch = currentNow;
-                        if (window.AndroidBridge) {
-                            try {
-                                const raw = (typeof window.AndroidBridge.getFrequencySpectrum === 'function') ?
-                                    window.AndroidBridge.getFrequencySpectrum() :
-                                    (typeof window.AndroidBridge.getVisualizerData === 'function' ? window.AndroidBridge.getVisualizerData() : null);
-                                if (raw && raw.length > 2) {
-                                    const parsed = JSON.parse(raw);
-                                    if (Array.isArray(parsed) && parsed.length > 0) {
-                                        for (let i = 0; i < this.spectrumSize; i++) {
-                                            this.rawSpectrum[i] = i < parsed.length ? (parsed[i] || 0) : 0;
-                                        }
+                    // Throttle polling to maximum 24 times a second (42ms) to eliminate CPU overload & UI stutter
+                    if (currentNow - this.lastFetch < 42) return;
+                    this.lastFetch = currentNow;
+
+                    if (window.AndroidBridge) {
+                        try {
+                            const raw = (typeof window.AndroidBridge.getFrequencySpectrum === 'function') ?
+                                window.AndroidBridge.getFrequencySpectrum() :
+                                (typeof window.AndroidBridge.getVisualizerData === 'function' ? window.AndroidBridge.getVisualizerData() : null);
+                            if (raw && raw.length > 2) {
+                                const parsed = JSON.parse(raw);
+                                if (Array.isArray(parsed) && parsed.length > 0) {
+                                    for (let i = 0; i < this.spectrumSize; i++) {
+                                        this.rawSpectrum[i] = i < parsed.length ? (parsed[i] || 0) : 0;
                                     }
                                 }
-                            } catch (_) {}
-                        } else if (webAudioSupported && analyserNode && freqData) {
-                            analyserNode.getByteFrequencyData(freqData);
-                            const step = freqData.length / this.spectrumSize;
-                            for (let i = 0; i < this.spectrumSize; i++) {
-                                const bin = Math.min(freqData.length - 1, Math.floor(i * step));
-                                this.rawSpectrum[i] = freqData[bin] || 0;
                             }
+                        } catch (_) {}
+                    } else if (webAudioSupported && analyserNode && freqData) {
+                        analyserNode.getByteFrequencyData(freqData);
+                        const step = freqData.length / this.spectrumSize;
+                        for (let i = 0; i < this.spectrumSize; i++) {
+                            const bin = Math.min(freqData.length - 1, Math.floor(i * step));
+                            this.rawSpectrum[i] = freqData[bin] || 0;
                         }
                     }
 
@@ -4327,12 +4244,7 @@
                         if (bpmPulse < 0.01) bpmPulse = 0;
                     }
 
-                    // Smooth continuous rhythmic wave
-                    const beatPeriodMs = 60000 / (liveBpm || 130);
-                    const beatDelta = lastTransientTime > 0 ? (currentNow - lastTransientTime) : currentNow;
-                    const phaseNorm = (beatDelta % beatPeriodMs) / beatPeriodMs;
-                    const rhythmicPulse = isPlaying ? Math.pow(Math.max(0, 1 - phaseNorm * 2.3), 3) * 0.35 : 0;
-                    effectivePulse = Math.max(bpmPulse, rhythmicPulse);
+                    // Rhythmic pulse calculation stripped out - visualizer strictly driven by real audio data (smoothedBass & peakEnergy)
 
                     // Throttled BPM text readout to eliminate DOM style thrashing (only when player view is active)
                     if (currentNow - lastBpmTextUpdate >= 250) {
@@ -4373,30 +4285,18 @@
                     updateDynamicMastering(rollingTrackPeak);
 
                     // =========================================================================
-                    // TASK 3: DYNAMIC SCREEN SHAKE DOM LOGIC ON HEAVY BASS DROP (> 0.82)
+                    // TASK 3: DYNAMIC SCREEN SHAKE ON BASS (> 0.85)
                     // =========================================================================
-                    const shakeStage = document.querySelector('.art-stage');
                     const shakeCanvas = document.getElementById('visualizer-canvas');
-                    const peakBassLevel = Math.max(smoothedBass, bassPeak, bassPower);
-
-                    if (isPlaying && peakBassLevel > 0.82) {
-                        const intensity = Math.min(1.0, (peakBassLevel - 0.82) / 0.18);
-                        const maxShift = 2.5 + intensity * 3.5; // -6px to +6px violent offset
-                        const shakeX = (Math.random() * (maxShift * 2) - maxShift).toFixed(1);
-                        const shakeY = (Math.random() * (maxShift * 2) - maxShift).toFixed(1);
-                        const shakeDeg = ((Math.random() - 0.5) * 1.8).toFixed(2);
-                        if (shakeStage) {
-                            shakeStage.style.transform = `translate(${shakeX}px, ${shakeY}px) rotate(${shakeDeg}deg)`;
-                        } else if (shakeCanvas) {
+                    if (shakeCanvas) {
+                        if (isPlaying && smoothedBass > 0.85) {
+                            const shakeX = ((Math.random() * 8) - 4).toFixed(1);
+                            const shakeY = ((Math.random() * 8) - 4).toFixed(1);
                             shakeCanvas.style.transform = `translate(${shakeX}px, ${shakeY}px)`;
-                        }
-                    } else {
-                        // Smoothly return to center when bass drops
-                        if (shakeStage && shakeStage.style.transform && shakeStage.style.transform !== 'translate(0px, 0px)') {
-                            shakeStage.style.transform = 'translate(0px, 0px)';
-                        }
-                        if (shakeCanvas && shakeCanvas.style.transform && shakeCanvas.style.transform !== 'translate(0px, 0px)') {
-                            shakeCanvas.style.transform = 'translate(0px, 0px)';
+                        } else {
+                            if (shakeCanvas.style.transform && shakeCanvas.style.transform !== 'translate(0px, 0px)' && shakeCanvas.style.transform !== 'none') {
+                                shakeCanvas.style.transform = 'translate(0px, 0px)';
+                            }
                         }
                     }
                 }
@@ -4446,36 +4346,33 @@
 
                 if (isPlayerActive) {
                     if (canvasCtx && canvas) {
+                        // FIX 1: High-DPI DevicePixelRatio Scaling
+                        const dpr = window.devicePixelRatio || 1;
+                        const clientW = canvas.clientWidth || 250;
+                        const clientH = canvas.clientHeight || 250;
+                        const physicalW = Math.round(clientW * dpr);
+                        const physicalH = Math.round(clientH * dpr);
+
+                        if (canvas.width !== physicalW || canvas.height !== physicalH) {
+                            canvas.width = physicalW;
+                            canvas.height = physicalH;
+                        }
+
+                        // FIX 2: Strict full physical canvas clearance before drawing ANY new frame
+                        canvasCtx.setTransform(1, 0, 0, 1, 0, 0);
                         canvasCtx.globalCompositeOperation = 'source-over';
                         canvasCtx.globalAlpha = 1.0;
                         canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
 
-                        // Direct canvas-rendered dynamic BPM neon pulse using dynamic extracted RGB
-                        const totalPulse = Math.min(1.0, effectivePulse * 0.55 + bassFlashOpacity * 0.45);
-                        if (totalPulse > 0.02 && isPlaying) {
-                            const pR = Math.round(dynamicR + totalPulse * (255 - dynamicR) * 0.4);
-                            const pG = Math.round(dynamicG * (1 - totalPulse * 0.2));
-                            const pB = Math.round(dynamicB + totalPulse * (255 - dynamicB) * 0.3);
-                            const alpha = (totalPulse * 0.22).toFixed(3);
-                            canvasCtx.fillStyle = `rgba(${pR}, ${pG}, ${pB}, ${alpha})`;
-                            canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
-                        }
-
-                        // Bass-hit inner canvas flash glow with dynamic color
-                        if (bassFlashOpacity > 0.02) {
-                            canvasCtx.save();
-                            canvasCtx.globalCompositeOperation = 'source-over';
-                            canvasCtx.fillStyle = `rgba(${dynamicR}, ${dynamicG}, ${dynamicB}, ${(bassFlashOpacity * 0.25).toFixed(3)})`;
-                            canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
-                            canvasCtx.restore();
-                        }
+                        // Scale context by dpr for razor-sharp rendering in CSS logical coordinates
+                        canvasCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
                         canvasCtx.save();
 
                         // Clean composite mode for visualizer patterns
                         canvasCtx.globalCompositeOperation = 'source-over';
-                        const cx = canvas.width / 2;
-                        const cy = canvas.height / 2;
+                        const cx = clientW / 2;
+                        const cy = clientH / 2;
                         const glowIntensity = 12 + smoothedBass * 18;
 
                         // Pattern cross-fade transition calculation
@@ -5254,13 +5151,14 @@
 
                         if (window.AndroidBridge && typeof window.AndroidBridge.updateMediaMetadata === 'function') {
                             try {
+                                const audioPath = track.path || track.contentUri || '';
                                 window.AndroidBridge.updateMediaMetadata(
                                     track.title || '',
                                     track.artist || '',
                                     isPlaying,
                                     track.duration || 0,
                                     Math.round((coreAudio.currentTime || 0) * 1000),
-                                    artUrl
+                                    audioPath
                                 );
                             } catch (_) {}
                         }
@@ -5278,9 +5176,21 @@
                 setTimeout(updateCoverArt, 150);
             }
 
+            let isUserToggling = false;
             window.togglePlayPause = function() {
-                if (isPlaying) window.pauseAudio();
-                else window.playAudio();
+                if (isUserToggling) return;
+                isUserToggling = true;
+                try {
+                    if (isPlaying) {
+                        window.pauseAudio();
+                    } else {
+                        window.playAudio();
+                    }
+                } finally {
+                    setTimeout(() => {
+                        isUserToggling = false;
+                    }, 350);
+                }
             };
 
             window.toggleShuffle = function() {
@@ -5357,14 +5267,15 @@
 
                 if (window.AndroidBridge && typeof window.AndroidBridge.updateMediaMetadata === 'function') {
                     try {
-                        const artUrl = track.artBase64 || track.coverArt || track.artUrl || (track.path || track.contentUri || '');
+                        const audioPath = track.path || track.contentUri || '';
+                        const pos = Math.round((coreAudio.currentTime || 0) * 1000);
                         window.AndroidBridge.updateMediaMetadata(
                             track.title || '',
                             track.artist || '',
                             true,
                             track.duration || 0,
-                            0,
-                            artUrl
+                            pos,
+                            audioPath
                         );
                     } catch (_) {}
                 }
@@ -5391,28 +5302,30 @@
                 if (window.AndroidBridge && typeof window.AndroidBridge.updateMediaMetadata === 'function') {
                     const trk = filteredPlaylist[currentTrackIndex];
                     if (trk) {
-                        const artUrl = trk.artBase64 || trk.coverArt || trk.artUrl || (trk.path || trk.contentUri || '');
+                        const audioPath = trk.path || trk.contentUri || '';
+                        const pos = Math.round((coreAudio.currentTime || 0) * 1000);
                         window.AndroidBridge.updateMediaMetadata(
                             trk.title || '',
                             trk.artist || '',
                             false,
                             trk.duration || 6000,
-                            Math.round((coreAudio.currentTime || 0) * 1000),
-                            artUrl
+                            pos,
+                            audioPath
                         );
                     }
                 }
             };
 
             let lastSkipTime = 0;
-            window.playNext = function() {
+            window.playNext = function(force = false) {
                 if (filteredPlaylist.length === 0) return;
                 const now = Date.now();
-                if (now - lastSkipTime < 250) return;
+                if (!force && now - lastSkipTime < 250) return;
                 lastSkipTime = now;
                 let nextIdx = currentTrackIndex + 1;
                 if (isShuffled) nextIdx = Math.floor(Math.random() * filteredPlaylist.length);
                 else if (nextIdx >= filteredPlaylist.length) nextIdx = 0;
+                isPlaying = true;
                 loadTrack(nextIdx, true);
             };
 
@@ -5434,35 +5347,49 @@
                 loadTrack(prevIdx, true);
             };
 
-            // Native Android IPC Callbacks
+            // Native Android IPC Callbacks - Decoupled UI state from native commands to eliminate infinite loops
             window.onNativePlaybackState = function(playing, posMs, durMs) {
                 if (isSeeking) return;
-                if (playing) {
+                if (isUserToggling) return;
+
+                const nextPlaying = !!playing;
+                if (nextPlaying) {
                     isSystemPaused = false;
                     window.isSystemPaused = false;
                 }
-                if (playing !== isPlaying) {
-                    isPlaying = playing;
-                    updatePlayButtonUI(playing);
-                    updateCardPlayState(playing);
-                    if (playing && !isLoopRunning) {
+                if (nextPlaying !== isPlaying) {
+                    isPlaying = nextPlaying;
+                    updatePlayButtonUI(isPlaying);
+                    updateCardPlayState(isPlaying);
+                    if (isPlaying && !isLoopRunning) {
                         isLoopRunning = true;
-                        runFrame();
+                        requestAnimationFrame(runFrame);
+                    } else if (!isPlaying && isLoopRunning) {
+                        isLoopRunning = false;
+                        if (animId) {
+                            cancelAnimationFrame(animId);
+                            animId = null;
+                        }
+                        drawIdleCanvas();
                     }
                 }
                 const curSec = (posMs || 0) / 1000;
                 const durSec = (durMs || 0) / 1000;
-                document.getElementById('label-cur-time').textContent = formatTime(curSec);
+                const labelCur = document.getElementById('label-cur-time');
+                if (labelCur) labelCur.textContent = formatTime(curSec);
                 if (durSec > 0.5) {
-                    document.getElementById('label-dur-time').textContent = formatTime(durSec);
+                    const labelDur = document.getElementById('label-dur-time');
+                    if (labelDur) labelDur.textContent = formatTime(durSec);
                     const pct = Math.min(100, Math.max(0, (posMs / durMs) * 100));
-                    document.getElementById('scrub-fill').style.width = pct + '%';
-                    document.getElementById('scrub-knob').style.left = pct + '%';
+                    const scrubFill = document.getElementById('scrub-fill');
+                    if (scrubFill) scrubFill.style.width = pct + '%';
+                    const scrubKnob = document.getElementById('scrub-knob');
+                    if (scrubKnob) scrubKnob.style.left = pct + '%';
                     const miniFill = document.getElementById('mini-scrub-fill');
                     if (miniFill) miniFill.style.width = pct + '%';
 
-                    // PROTOCOL 4: Smooth XFADE volume fading without premature cutting/skipping
-                    if (playing && crossfadeSeconds > 0 && durSec > (crossfadeSeconds + 2)) {
+                    // Smooth XFADE volume fading without premature cutting/skipping
+                    if (nextPlaying && crossfadeSeconds > 0 && durSec > (crossfadeSeconds + 2)) {
                         const remainingSec = durSec - curSec;
                         if (remainingSec <= crossfadeSeconds && remainingSec > 0) {
                             const fadeRatio = Math.max(0.05, Math.min(1.0, remainingSec / crossfadeSeconds));
@@ -5486,12 +5413,14 @@
             window.onNativePlaybackCompleted = function() {
                 // Ensure full volume restored for next track
                 if (window.AndroidBridge && typeof window.AndroidBridge.setVolume === 'function') {
-                    window.AndroidBridge.setVolume(1.0);
+                    try { window.AndroidBridge.setVolume(1.0); } catch (_) {}
                 }
+                lastSkipTime = 0; // Reset skip debounce so auto-play is NEVER blocked
+                isPlaying = true; // Ensure isPlaying state is handed over to the next track
                 if (repeatMode === 2) {
                     loadTrack(currentTrackIndex, true);
                 } else {
-                    window.playNext();
+                    window.playNext(true);
                 }
             };
 
@@ -5526,7 +5455,9 @@
             window.setSystemPaused = function(val) {
                 isSystemPaused = !!val;
                 window.isSystemPaused = !!val;
-                if (isSystemPaused) {
+                if (val) {
+                    isSystemInterrupted = true;
+                    window.isSystemInterrupted = true;
                     isPlaying = false;
                     isRecovering = false;
                     updatePlayButtonUI(false);
@@ -5539,11 +5470,14 @@
                     if (coreAudio && !coreAudio.paused) {
                         try { coreAudio.pause(); } catch (_) {}
                     }
+                } else {
+                    isSystemInterrupted = false;
+                    window.isSystemInterrupted = false;
                 }
             };
 
             function isAudioFocusOrHidden() {
-                if (document.hidden) return true;
+                if (document.hidden || isSystemInterrupted || window.isSystemInterrupted) return true;
                 if (isAudioFocusLost || isPausedByAudioFocus || isSystemPaused || window.isSystemPaused) return true;
                 if (window.AndroidBridge && typeof window.AndroidBridge.isAudioFocusLost === 'function') {
                     try {
@@ -5555,6 +5489,8 @@
 
             window.onNativeAudioFocusChanged = function(isLost) {
                 isAudioFocusLost = !!isLost;
+                isSystemInterrupted = !!isLost;
+                window.isSystemInterrupted = !!isLost;
                 if (isAudioFocusLost) {
                     isPausedByAudioFocus = true;
                     isSystemPaused = true;
@@ -5574,16 +5510,20 @@
                     drawIdleCanvas();
                 } else {
                     isPausedByAudioFocus = false;
+                    isSystemInterrupted = false;
+                    window.isSystemInterrupted = false;
                 }
             };
 
             document.addEventListener('visibilitychange', () => {
+                isSystemInterrupted = document.hidden;
                 if (document.hidden) {
                     isRecovering = false;
                 }
             });
 
             window.onNativeVisibilityChanged = function(isVisible) {
+                isSystemInterrupted = !isVisible;
                 if (!isVisible) {
                     isRecovering = false;
                 }
@@ -5652,7 +5592,8 @@
 
             function triggerSilentAutoRecovery(reason) {
                 // STRICT CHECK: COMPLETELY KILL the auto-recovery trigger if document.hidden is true or a system-level pause occurred
-                if (document.hidden || isSystemPaused || window.isSystemPaused || isAudioFocusOrHidden() || !isPlaying || isSeeking || isRecovering) return;
+                if (isSystemInterrupted || document.hidden || !isPlaying) return;
+                if (isSystemPaused || window.isSystemPaused || isAudioFocusOrHidden() || isSeeking || isRecovering) return;
                 const dur = coreAudio.duration || 0;
                 const cur = coreAudio.currentTime || 0;
                 if (dur > 0 && cur >= (dur - 0.6)) return;
@@ -5671,7 +5612,11 @@
                     const savedSrc = coreAudio.src;
                     setTimeout(() => {
                         // STRICT CHECK: DO NOT auto-recover or force .play() if document.hidden is true or system-level pause occurred
-                        if (document.hidden || isSystemPaused || window.isSystemPaused || isAudioFocusOrHidden() || !isPlaying || isSeeking) {
+                        if (isSystemInterrupted || document.hidden || !isPlaying) {
+                            isRecovering = false;
+                            return;
+                        }
+                        if (isSystemPaused || window.isSystemPaused || isAudioFocusOrHidden() || isSeeking) {
                             isRecovering = false;
                             return;
                         }
@@ -5681,7 +5626,7 @@
                             }
                             coreAudio.load();
                             coreAudio.currentTime = savedTime;
-                            if (!document.hidden && !isSystemPaused && !window.isSystemPaused && !isAudioFocusOrHidden() && isPlaying && !isSeeking) {
+                            if (!isSystemInterrupted && !document.hidden && !isSystemPaused && !window.isSystemPaused && !isAudioFocusOrHidden() && isPlaying && !isSeeking) {
                                 coreAudio.play().then(() => {
                                     isRecovering = false;
                                 }).catch(() => {
@@ -5695,7 +5640,7 @@
                         }
                     }, 280);
                 } else {
-                    if (!document.hidden && !isSystemPaused && !window.isSystemPaused && !isAudioFocusOrHidden() && isPlaying && !isSeeking) {
+                    if (!isSystemInterrupted && !document.hidden && !isSystemPaused && !window.isSystemPaused && !isAudioFocusOrHidden() && isPlaying && !isSeeking) {
                         coreAudio.play().then(() => {
                             isRecovering = false;
                         }).catch(() => {
@@ -5709,9 +5654,11 @@
 
             coreAudio.addEventListener('stalled', () => {
                 // STRICT CHECK: COMPLETELY KILL the auto-recovery trigger if document.hidden is true or system-level pause occurred
-                if (document.hidden || isSystemPaused || window.isSystemPaused || isAudioFocusOrHidden() || !isPlaying || isSeeking) return;
+                if (isSystemInterrupted || document.hidden || !isPlaying) return;
+                if (isSystemPaused || window.isSystemPaused || isAudioFocusOrHidden() || isSeeking) return;
                 setTimeout(() => {
-                    if (document.hidden || isSystemPaused || window.isSystemPaused || isAudioFocusOrHidden() || !isPlaying || isSeeking) return;
+                    if (isSystemInterrupted || document.hidden || !isPlaying) return;
+                    if (isSystemPaused || window.isSystemPaused || isAudioFocusOrHidden() || isSeeking) return;
                     if (coreAudio.readyState < 3) {
                         triggerSilentAutoRecovery('stalled');
                     }
@@ -5720,9 +5667,11 @@
 
             coreAudio.addEventListener('waiting', () => {
                 // STRICT CHECK: COMPLETELY KILL the auto-recovery trigger if document.hidden is true or system-level pause occurred
-                if (document.hidden || isSystemPaused || window.isSystemPaused || isAudioFocusOrHidden() || !isPlaying || isSeeking) return;
+                if (isSystemInterrupted || document.hidden || !isPlaying) return;
+                if (isSystemPaused || window.isSystemPaused || isAudioFocusOrHidden() || isSeeking) return;
                 setTimeout(() => {
-                    if (document.hidden || isSystemPaused || window.isSystemPaused || isAudioFocusOrHidden() || !isPlaying || isSeeking) return;
+                    if (isSystemInterrupted || document.hidden || !isPlaying) return;
+                    if (isSystemPaused || window.isSystemPaused || isAudioFocusOrHidden() || isSeeking) return;
                     if (coreAudio.readyState < 3) {
                         triggerSilentAutoRecovery('waiting');
                     }
@@ -5735,7 +5684,8 @@
             let lastWatchdogAttempt = 0;
             setInterval(() => {
                 // STRICT CHECK: COMPLETELY KILL auto-recovery trigger if document.hidden is true or system-level pause occurred
-                if (document.hidden || isSystemPaused || window.isSystemPaused || isAudioFocusOrHidden() || !isPlaying || isSeeking) return;
+                if (isSystemInterrupted || document.hidden || !isPlaying) return;
+                if (isSystemPaused || window.isSystemPaused || isAudioFocusOrHidden() || isSeeking) return;
                 // Native Android handles playback when AndroidBridge is available - do not interfere with native player
                 if (window.AndroidBridge) return;
 
@@ -6647,12 +6597,16 @@
                         const miniFallback = document.getElementById('mini-art-fallback');
 
                         if (song.artBase64) {
-                            if (artImg) { artImg.src = song.artBase64; artImg.style.display = 'block'; }
+                            if (artImg) {
+                                artImg.src = song.artBase64;
+                                artImg.style.display = 'block';
+                                extractDominantColor(artImg);
+                            }
                             if (artFallback) artFallback.style.display = 'none';
                             if (miniImg) { miniImg.src = song.artBase64; miniImg.style.display = 'block'; }
                             if (miniFallback) miniFallback.style.display = 'none';
                         } else {
-                            if (artImg) artImg.style.display = 'none';
+                            if (artImg) { artImg.style.display = 'none'; resetDynamicColor(); }
                             if (artFallback) artFallback.style.display = 'flex';
                             if (miniImg) miniImg.style.display = 'none';
                             if (miniFallback) miniFallback.style.display = 'inline';
@@ -6661,14 +6615,15 @@
 
                     if (window.AndroidBridge && typeof window.AndroidBridge.updateMediaMetadata === 'function') {
                         try {
-                            const artUrl = song.artBase64 || song.coverArt || song.artUrl || (song.path || song.contentUri || '');
+                            const audioPath = song.path || song.contentUri || '';
+                            const pos = Math.round((coreAudio.currentTime || 0) * 1000);
                             window.AndroidBridge.updateMediaMetadata(
                                 song.title,
                                 song.artist,
                                 isPlaying,
                                 song.duration || 0,
-                                0,
-                                artUrl
+                                pos,
+                                audioPath
                             );
                         } catch (_) {}
                     }
