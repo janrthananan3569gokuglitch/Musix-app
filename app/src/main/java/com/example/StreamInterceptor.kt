@@ -18,6 +18,33 @@ class StreamInterceptor(private val context: Context) {
 
     fun intercept(request: WebResourceRequest): WebResourceResponse? {
         val url = request.url.toString()
+
+        // Handle Album Art / Song Image requests
+        val artPrefix = "https://appassets.androidplatform.net/album-art/"
+        if (url.startsWith(artPrefix)) {
+            val target = Uri.decode(url.substring(artPrefix.length))
+            val bytes = CoverArtResolver.getArtBytes(context, target)
+            if (bytes != null && bytes.isNotEmpty()) {
+                val mime = if (bytes.size > 8 && bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte()) "image/png" else "image/jpeg"
+                val headers = mapOf(
+                    "Content-Type" to mime,
+                    "Access-Control-Allow-Origin" to "*",
+                    "Cache-Control" to "public, max-age=604800",
+                    "Content-Length" to bytes.size.toString()
+                )
+                return WebResourceResponse(mime, null, 200, "OK", headers, java.io.ByteArrayInputStream(bytes))
+            } else {
+                val transparent1x1 = android.util.Base64.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=", android.util.Base64.DEFAULT)
+                val headers = mapOf(
+                    "Content-Type" to "image/png",
+                    "Access-Control-Allow-Origin" to "*",
+                    "Cache-Control" to "public, max-age=86400",
+                    "Content-Length" to transparent1x1.size.toString()
+                )
+                return WebResourceResponse("image/png", null, 200, "OK", headers, java.io.ByteArrayInputStream(transparent1x1))
+            }
+        }
+
         val localPrefix = "https://appassets.androidplatform.net/local-audio/"
         val isLocalAudio = url.startsWith(localPrefix)
         val isAssetAudio = url.contains("/assets/vault/audio/") || (url.startsWith("https://appassets.androidplatform.net/assets/") && (url.endsWith(".wav") || url.endsWith(".mp3") || url.endsWith(".flac") || url.endsWith(".ogg") || url.endsWith(".m4a")))
@@ -123,7 +150,11 @@ class StreamInterceptor(private val context: Context) {
             }
 
             if (pfd == null) {
-                return null
+                val emptyHeaders = mapOf(
+                    "Access-Control-Allow-Origin" to "*",
+                    "Content-Length" to "0"
+                )
+                return WebResourceResponse("audio/mpeg", "UTF-8", 204, "No Content", emptyHeaders, java.io.ByteArrayInputStream(ByteArray(0)))
             }
 
             val mimeType = resolveMimeType(decodedPath, uri, pfd)
@@ -174,7 +205,7 @@ class StreamInterceptor(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.e(tag, "Stream error: ${e.message}")
-            return null
+            return WebResourceResponse("audio/mpeg", "UTF-8", 204, "No Content", mapOf("Access-Control-Allow-Origin" to "*", "Content-Length" to "0"), java.io.ByteArrayInputStream(ByteArray(0)))
         }
     }
 

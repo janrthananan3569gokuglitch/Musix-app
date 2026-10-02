@@ -17,6 +17,9 @@ import android.util.Base64
 import android.util.Log
 import android.util.LruCache
 import android.webkit.JavascriptInterface
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -108,7 +111,23 @@ class AndroidBridge(
                 activity.evaluateJs("window.onNativeMediaAction && window.onNativeMediaAction('$action')")
             }
         }
+        AudioVaultService.onAudioFocusChanged = { isLost ->
+            nativeAudioFocusLost = isLost
+            activity.runOnUiThread {
+                if (isLost) {
+                    activity.evaluateJs("window.isSystemPaused = true; if (typeof window.setSystemPaused === 'function') window.setSystemPaused(true); if (window.onNativeAudioFocusChanged) window.onNativeAudioFocusChanged(true);")
+                } else {
+                    activity.evaluateJs("window.isSystemPaused = false; if (typeof window.setSystemPaused === 'function') window.setSystemPaused(false); if (window.onNativeAudioFocusChanged) window.onNativeAudioFocusChanged(false);")
+                }
+            }
+        }
     }
+
+    @Volatile
+    private var nativeAudioFocusLost = false
+
+    @JavascriptInterface
+    fun isAudioFocusLost(): Boolean = nativeAudioFocusLost
 
     // =========================================================================
     // NATIVE AUDIO PLAYBACK JAVASCRIPT INTERFACES
@@ -117,7 +136,12 @@ class AndroidBridge(
     @JavascriptInterface
     fun playTrack(pathOrUri: String, title: String, artist: String, album: String): Boolean {
         logEvent("PLAY", "playTrack invoked for: $title ($pathOrUri)")
-        return getAudioService()?.playTrack(pathOrUri, title, artist, album) ?: false
+        val svc = getAudioService() ?: return false
+        if (svc.getCurrentTrackPath() == pathOrUri && !svc.isAudioPlaying()) {
+            logEvent("PLAY", "Seamlessly resuming existing paused track: $pathOrUri")
+            return svc.resumePlayback()
+        }
+        return svc.playTrack(pathOrUri, title, artist, album)
     }
 
     @JavascriptInterface
@@ -165,6 +189,11 @@ class AndroidBridge(
 
     @JavascriptInterface
     fun setMasterVolume(vol: Float) {
+        getAudioService()?.setMasterVolume(vol)
+    }
+
+    @JavascriptInterface
+    fun setVolume(vol: Float) {
         getAudioService()?.setMasterVolume(vol)
     }
 
@@ -234,8 +263,8 @@ class AndroidBridge(
             }
         }
 
-        // Apply real-time 3D spatial panning directly into native audio engine ONLY if enabled
-        if (spatialMode != "center") {
+        // Apply real-time 3D spatial panning directly into native audio engine ONLY when in gyro mode
+        if (spatialMode == "gyro") {
             applyNativeSpatialPanning()
         }
     }
@@ -290,6 +319,7 @@ class AndroidBridge(
     fun setSpatialMode(mode: String): String {
         spatialMode = mode.lowercase(Locale.ROOT)
         logEvent("SPATIAL", "Spatial mode set to: $spatialMode")
+        getAudioService()?.setSpatialMode(spatialMode)
         if (spatialMode == "gyro") {
             hasCalibrated = false
         } else if (spatialMode == "orbit" || spatialMode == "8d" || spatialMode == "atmos") {
@@ -433,131 +463,195 @@ class AndroidBridge(
         return candidates.firstOrNull { it.exists() && it.isDirectory } ?: direct
     }
 
+    @Volatile private var cachedScanJson: String = "[]"
+
     @JavascriptInterface
     fun scanPhonks(): String = scanPhonksFolder()
 
     @JavascriptInterface
     fun scanCustomPath(path: String): String {
         if (path.isNotBlank()) configuredPath = path.trim()
-        return scanPhonksFolder()
+        scanPhonksFolderAsync()
+        return cachedScanJson
+    }
+
+    @JavascriptInterface
+    fun scanPhonksFolderAsync() {
+        CoroutineScope(Dispatchers.IO).launch {
+            val json = performShallowScan(configuredPath)
+            cachedScanJson = json
+            activity.runOnUiThread {
+                activity.evaluateJs("if (window.onScanComplete) { window.onScanComplete(${JSONObject.quote(json)}); } else if (window.onTracksDiscovered) { window.onTracksDiscovered(${JSONObject.quote(json)}); }")
+            }
+        }
     }
 
     @JavascriptInterface
     fun scanPhonksFolder(): String {
-        val targetPath = configuredPath
-        logEvent("SCAN", "Native zero-duplicate scan triggered for: $targetPath")
+        // Asynchronously scan in background on IO dispatcher to NEVER block the Main/JS thread
+        CoroutineScope(Dispatchers.IO).launch {
+            val json = performShallowScan(configuredPath)
+            cachedScanJson = json
+            activity.runOnUiThread {
+                activity.evaluateJs("if (window.onScanComplete) { window.onScanComplete(${JSONObject.quote(json)}); } else if (window.onTracksDiscovered) { window.onTracksDiscovered(${JSONObject.quote(json)}); }")
+            }
+        }
+        return cachedScanJson
+    }
+
+    fun performShallowScan(targetPath: String): String {
+        logEvent("SCAN", "Native target scan triggered for: $targetPath")
         val jsonArray = JSONArray()
 
         val seenPaths = HashSet<String>()
-        val seenFileNames = HashSet<String>()
-        val seenNormalizedKeys = HashSet<String>()
-        val seenTitleKeys = HashSet<String>()
-
         val exactMatches = ArrayList<JSONObject>()
-        val otherMatches = ArrayList<JSONObject>()
-        val audioExtensions = setOf("flac", "wav", "aiff", "aif", "aifc", "alac", "ape", "wv", "pcm", "m4a", "mp3", "aac", "ogg", "opus", "wma")
+        val audioExtensions = setOf("flac", "wav", "aiff", "aif", "aifc", "alac", "ape", "wv", "pcm", "m4a", "mp3", "aac", "ogg", "opus", "wma", "mp4", "m4b")
 
-        // 1. Direct Primary Scan on Target Folder
+        // 1. Direct Scan on Target Folder (/storage/3263-3638/phonks) - immediate & subdirectories
         val primaryDir = resolveTargetDirectory(targetPath)
         var directId = 1000L
 
-        fun scanDir(dir: File, isTarget: Boolean) {
+        if (primaryDir != null && primaryDir.exists() && primaryDir.isDirectory) {
+            val mediaStoreCache = HashMap<String, Triple<String?, String?, Long>>()
             try {
-                if (!dir.exists() || !dir.isDirectory) return
-                val files = dir.listFiles() ?: return
-                for (file in files) {
-                    if (file.isDirectory && !file.name.startsWith(".")) {
-                        scanDir(file, isTarget)
-                    } else if (file.isFile) {
-                        val ext = file.extension.lowercase(Locale.ROOT)
-                        if (audioExtensions.contains(ext)) {
-                            val path = file.absolutePath
-                            val pathLower = path.lowercase(Locale.ROOT)
-                            val fNameLower = file.name.lowercase(Locale.ROOT)
-                            val title = file.nameWithoutExtension.ifBlank { "Phonk Track" }
-                            val normKey = normalizeTrackKey(title, file.name)
-                            val titleKey = title.lowercase(Locale.ROOT).replace(Regex("[^a-z0-9]"), "")
-
-                            if (seenPaths.contains(pathLower) ||
-                                seenFileNames.contains(fNameLower) ||
-                                (normKey.isNotBlank() && seenNormalizedKeys.contains(normKey)) ||
-                                (titleKey.isNotBlank() && seenTitleKeys.contains(titleKey))) {
-                                continue
-                            }
-
-                            seenPaths.add(pathLower)
-                            seenFileNames.add(fNameLower)
-                            if (normKey.isNotBlank()) seenNormalizedKeys.add(normKey)
-                            if (titleKey.isNotBlank()) seenTitleKeys.add(titleKey)
-
-                            val isExact = isTarget || path.startsWith(targetPath) || path.contains("/phonks", ignoreCase = true)
-                            val parentName = file.parentFile?.name ?: ""
-                            val albumName = if (parentName.isNotBlank() && !parentName.equals("phonks", true) && !parentName.equals("Music", true) && !parentName.equals("Download", true)) {
-                                parentName
-                            } else {
-                                "Phonk Master Series"
-                            }
-                            val bitDepth = if (ext in listOf("flac", "alac", "aiff", "aif", "ape", "wv")) 24 else 16
-
-                            val item = JSONObject().apply {
-                                put("id", directId++)
-                                put("path", path)
-                                put("contentUri", "file://$path")
-                                put("streamUrl", "https://appassets.androidplatform.net/local-audio/${Uri.encode(path)}")
-                                put("title", title)
-                                put("artist", if (isExact) "SD Phonk Vault" else "XP Phonk Vault")
-                                put("album", albumName)
-                                put("bitDepth", bitDepth)
-                                put("duration", 0L)
-                                put("size", file.length())
-                                put("lastModified", file.lastModified())
-                                put("mimeType", resolveAudioMime(path))
-                                put("isExactTarget", isExact)
-                            }
-
-                            if (isExact) exactMatches.add(item) else otherMatches.add(item)
+                val proj = arrayOf(
+                    MediaStore.Audio.Media.DATA,
+                    MediaStore.Audio.Media.TITLE,
+                    MediaStore.Audio.Media.ARTIST,
+                    MediaStore.Audio.Media.DURATION
+                )
+                val targetName = File(targetPath).name.ifBlank { "phonks" }
+                val sel = "${MediaStore.Audio.Media.DATA} LIKE ? OR ${MediaStore.Audio.Media.DATA} LIKE ?"
+                val selArgs = arrayOf("%$targetPath/%", "%/$targetName/%")
+                activity.contentResolver.query(
+                    MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                    proj,
+                    sel,
+                    selArgs,
+                    null
+                )?.use { c ->
+                    val dCol = c.getColumnIndex(MediaStore.Audio.Media.DATA)
+                    val tCol = c.getColumnIndex(MediaStore.Audio.Media.TITLE)
+                    val aCol = c.getColumnIndex(MediaStore.Audio.Media.ARTIST)
+                    val durCol = c.getColumnIndex(MediaStore.Audio.Media.DURATION)
+                    while (c.moveToNext()) {
+                        val p = if (dCol != -1) c.getString(dCol) else null
+                        if (!p.isNullOrBlank()) {
+                            val t = if (tCol != -1) c.getString(tCol) else null
+                            val a = if (aCol != -1) c.getString(aCol) else null
+                            val dur = if (durCol != -1) c.getLong(durCol) else 0L
+                            mediaStoreCache[p.lowercase(Locale.ROOT)] = Triple(t, a, dur)
                         }
                     }
                 }
             } catch (_: Exception) {}
-        }
 
-        if (primaryDir != null && primaryDir.exists()) {
-            scanDir(primaryDir, isTarget = true)
-        }
-
-        // 2. Direct Scan on Common Android Music Folders (SD Card, Music, Download)
-        val commonDirs = listOf(
-            File("/storage/emulated/0/Music"),
-            File("/storage/emulated/0/Download"),
-            File("/storage/emulated/0/phonks"),
-            File("/storage/emulated/0/Phonks"),
-            File("/sdcard/Music"),
-            File("/sdcard/Download"),
-            File("/sdcard/phonks")
-        )
-        for (cDir in commonDirs) {
-            if (cDir.exists() && cDir.isDirectory && cDir != primaryDir) {
-                scanDir(cDir, isTarget = false)
-            }
-        }
-
-        // Also check any mounted SD card roots
-        try {
-            val storageRoot = File("/storage")
-            if (storageRoot.exists() && storageRoot.isDirectory) {
-                storageRoot.listFiles()?.forEach { disk ->
-                    if (disk.isDirectory && disk.name != "emulated" && disk.name != "self") {
-                        val diskPhonks = File(disk, "phonks")
-                        val diskMusic = File(disk, "Music")
-                        if (diskPhonks.exists() && diskPhonks != primaryDir) scanDir(diskPhonks, isTarget = false)
-                        if (diskMusic.exists() && diskMusic != primaryDir) scanDir(diskMusic, isTarget = false)
+            var mmr: MediaMetadataRetriever? = null
+            try {
+                val filesToScan = mutableListOf<File>()
+                // Collect immediate files
+                primaryDir.listFiles()?.forEach { f ->
+                    if (f.isFile) {
+                        filesToScan.add(f)
+                    } else if (f.isDirectory) {
+                        // Include songs in sub-folders within the target phonks directory
+                        try {
+                            f.walkTopDown().maxDepth(3).filter { it.isFile }.forEach { sub ->
+                                filesToScan.add(sub)
+                            }
+                        } catch (_: Exception) {}
                     }
                 }
-            }
-        } catch (_: Exception) {}
 
-        // 3. Query MediaStore for deduplicated external tracks
+                for (file in filesToScan) {
+                    val ext = file.extension.lowercase(Locale.ROOT)
+                    if (audioExtensions.contains(ext)) {
+                        val path = file.absolutePath
+                        val pathLower = path.lowercase(Locale.ROOT)
+
+                        // Deduplicate ONLY on exact unique file path so ALL songs are shown
+                        if (seenPaths.contains(pathLower)) {
+                            continue
+                        }
+                        seenPaths.add(pathLower)
+
+                        val defaultTitle = file.nameWithoutExtension.ifBlank { "Phonk Track" }
+                        val parentName = file.parentFile?.name ?: ""
+                        val defaultAlbumName = if (parentName.isNotBlank() && !parentName.equals("phonks", true) && !parentName.equals("Music", true) && !parentName.equals("Download", true)) {
+                            parentName
+                        } else {
+                            "Phonk Master Series"
+                        }
+                        val bitDepth = if (ext in listOf("flac", "alac", "aiff", "aif", "ape", "wv")) 24 else 16
+
+                        var durationMs = 0L
+                        var metaTitle: String? = null
+                        var metaArtist: String? = null
+
+                        val cachedMeta = mediaStoreCache[pathLower]
+                        if (cachedMeta != null) {
+                            metaTitle = cachedMeta.first
+                            metaArtist = cachedMeta.second
+                            durationMs = cachedMeta.third
+                        } else {
+                            try {
+                                if (mmr == null) mmr = MediaMetadataRetriever()
+                                mmr.setDataSource(path)
+                                durationMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                                metaTitle = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)
+                                metaArtist = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)
+                            } catch (_: Exception) {}
+                        }
+
+                        var title = if (!metaTitle.isNullOrBlank()) metaTitle else defaultTitle
+                        var artist = if (!metaArtist.isNullOrBlank()) metaArtist else "SD Phonk Vault"
+                        var album = defaultAlbumName
+
+                        // Check permanent user metadata overrides
+                        val override = TrackMetadataStore.getOverride(activity, path)
+                        var isCoverRemoved = false
+                        var updatedAt = 0L
+                        if (override != null) {
+                            val overTitle = override.optString("title")
+                            val overArtist = override.optString("artist")
+                            val overAlbum = override.optString("album")
+                            if (!overTitle.isNullOrBlank()) title = overTitle
+                            if (!overArtist.isNullOrBlank()) artist = overArtist
+                            if (!overAlbum.isNullOrBlank()) album = overAlbum
+                            isCoverRemoved = override.optBoolean("isCoverRemoved", false)
+                            updatedAt = override.optLong("updatedAt", 0L)
+                        }
+
+                        val artUrl = if (isCoverRemoved) "" else "https://appassets.androidplatform.net/album-art/${Uri.encode(path)}${if (updatedAt > 0) "?t=$updatedAt" else ""}"
+
+                        val item = JSONObject().apply {
+                            put("id", directId++)
+                            put("path", path)
+                            put("contentUri", "file://$path")
+                            put("streamUrl", "https://appassets.androidplatform.net/local-audio/${Uri.encode(path)}")
+                            put("title", title)
+                            put("artist", artist)
+                            put("album", album)
+                            put("bitDepth", bitDepth)
+                            put("duration", durationMs)
+                            put("size", file.length())
+                            put("lastModified", file.lastModified())
+                            put("mimeType", resolveAudioMime(path))
+                            put("isExactTarget", true)
+                            put("isTagEdited", override != null)
+                            put("isCoverRemoved", isCoverRemoved)
+                            put("artUrl", artUrl)
+                        }
+                        exactMatches.add(item)
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                try { mmr?.release() } catch (_: Exception) {}
+            }
+        }
+
+        // 2. MediaStore Query for Target Path (ensures Scoped Storage on Android 11+ yields all songs)
         try {
             val projection = arrayOf(
                 MediaStore.Audio.Media._ID,
@@ -567,102 +661,95 @@ class AndroidBridge(
                 MediaStore.Audio.Media.ALBUM,
                 MediaStore.Audio.Media.DURATION,
                 MediaStore.Audio.Media.SIZE,
-                MediaStore.Audio.Media.DATE_MODIFIED,
-                MediaStore.Audio.Media.MIME_TYPE
+                MediaStore.Audio.Media.DATE_MODIFIED
             )
-
-            val sortOrder = "${MediaStore.Audio.Media.DATE_MODIFIED} DESC"
-            val selection = "${MediaStore.Audio.Media.SIZE} > 10000"
-
+            val selection = "${MediaStore.Audio.Media.DATA} LIKE ? OR ${MediaStore.Audio.Media.DATA} LIKE ?"
+            val selectionArgs = arrayOf("%3263-3638/phonks/%", "%/phonks/%")
             activity.contentResolver.query(
                 MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
                 projection,
                 selection,
-                null,
-                sortOrder
-            )?.use { c ->
-                val idCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
-                val dataCol = c.getColumnIndex(MediaStore.Audio.Media.DATA)
-                val titleCol = c.getColumnIndex(MediaStore.Audio.Media.TITLE)
-                val artistCol = c.getColumnIndex(MediaStore.Audio.Media.ARTIST)
-                val albumCol = c.getColumnIndex(MediaStore.Audio.Media.ALBUM)
-                val durationCol = c.getColumnIndex(MediaStore.Audio.Media.DURATION)
-                val sizeCol = c.getColumnIndex(MediaStore.Audio.Media.SIZE)
-                val dateCol = c.getColumnIndex(MediaStore.Audio.Media.DATE_MODIFIED)
-                val mimeCol = c.getColumnIndex(MediaStore.Audio.Media.MIME_TYPE)
+                selectionArgs,
+                null
+            )?.use { cursor ->
+                val dataCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATA)
+                val titleCol = cursor.getColumnIndex(MediaStore.Audio.Media.TITLE)
+                val artistCol = cursor.getColumnIndex(MediaStore.Audio.Media.ARTIST)
+                val albumCol = cursor.getColumnIndex(MediaStore.Audio.Media.ALBUM)
+                val durCol = cursor.getColumnIndex(MediaStore.Audio.Media.DURATION)
+                val sizeCol = cursor.getColumnIndex(MediaStore.Audio.Media.SIZE)
+                val modCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATE_MODIFIED)
 
-                while (c.moveToNext()) {
-                    val data = if (dataCol != -1) c.getString(dataCol) ?: "" else ""
-                    val rawTitle = if (titleCol != -1) c.getString(titleCol) ?: "" else ""
-                    val size = if (sizeCol != -1) c.getLong(sizeCol) else 0L
+                while (cursor.moveToNext()) {
+                    val path = if (dataCol != -1) cursor.getString(dataCol) else null
+                    if (!path.isNullOrBlank()) {
+                        val pathLower = path.lowercase(Locale.ROOT)
+                        if (!seenPaths.contains(pathLower)) {
+                            seenPaths.add(pathLower)
+                            val f = File(path)
+                            val ext = f.extension.lowercase(Locale.ROOT)
+                            if (audioExtensions.contains(ext)) {
+                                val bitDepth = if (ext in listOf("flac", "alac", "aiff", "aif", "ape", "wv")) 24 else 16
+                                var title = (if (titleCol != -1) cursor.getString(titleCol) else null)?.ifBlank { f.nameWithoutExtension } ?: f.nameWithoutExtension
+                                var artist = (if (artistCol != -1) cursor.getString(artistCol) else null)?.ifBlank { "SD Phonk Vault" } ?: "SD Phonk Vault"
+                                var album = (if (albumCol != -1) cursor.getString(albumCol) else null)?.ifBlank { "Phonk Master Series" } ?: "Phonk Master Series"
+                                val durationMs = if (durCol != -1) cursor.getLong(durCol) else 0L
+                                val size = if (sizeCol != -1) cursor.getLong(sizeCol) else f.length()
+                                val mod = if (modCol != -1) cursor.getLong(modCol) * 1000L else f.lastModified()
 
-                    val pathLower = data.lowercase(Locale.ROOT)
-                    val fName = if (data.isNotBlank()) File(data).name.lowercase(Locale.ROOT) else ""
-                    val normKey = normalizeTrackKey(rawTitle, fName)
-                    val titleKey = rawTitle.lowercase(Locale.ROOT).replace(Regex("[^a-z0-9]"), "")
+                                // Check permanent user metadata overrides
+                                val override = TrackMetadataStore.getOverride(activity, path)
+                                var isCoverRemoved = false
+                                var updatedAt = 0L
+                                if (override != null) {
+                                    val overTitle = override.optString("title")
+                                    val overArtist = override.optString("artist")
+                                    val overAlbum = override.optString("album")
+                                    if (!overTitle.isNullOrBlank()) title = overTitle
+                                    if (!overArtist.isNullOrBlank()) artist = overArtist
+                                    if (!overAlbum.isNullOrBlank()) album = overAlbum
+                                    isCoverRemoved = override.optBoolean("isCoverRemoved", false)
+                                    updatedAt = override.optLong("updatedAt", 0L)
+                                }
 
-                    if ((pathLower.isNotBlank() && seenPaths.contains(pathLower)) ||
-                        (fName.isNotBlank() && seenFileNames.contains(fName)) ||
-                        (normKey.isNotBlank() && seenNormalizedKeys.contains(normKey)) ||
-                        (titleKey.isNotBlank() && seenTitleKeys.contains(titleKey))) {
-                        continue
+                                val artUrl = if (isCoverRemoved) "" else "https://appassets.androidplatform.net/album-art/${Uri.encode(path)}${if (updatedAt > 0) "?t=$updatedAt" else ""}"
+
+                                exactMatches.add(JSONObject().apply {
+                                    put("id", directId++)
+                                    put("path", path)
+                                    put("contentUri", "file://$path")
+                                    put("streamUrl", "https://appassets.androidplatform.net/local-audio/${Uri.encode(path)}")
+                                    put("title", title)
+                                    put("artist", artist)
+                                    put("album", album)
+                                    put("bitDepth", bitDepth)
+                                    put("duration", durationMs)
+                                    put("size", size)
+                                    put("lastModified", mod)
+                                    put("mimeType", resolveAudioMime(path))
+                                    put("isExactTarget", true)
+                                    put("isTagEdited", override != null)
+                                    put("isCoverRemoved", isCoverRemoved)
+                                    put("artUrl", artUrl)
+                                })
+                            }
+                        }
                     }
-
-                    if (pathLower.isNotBlank()) seenPaths.add(pathLower)
-                    if (fName.isNotBlank()) seenFileNames.add(fName)
-                    if (normKey.isNotBlank()) seenNormalizedKeys.add(normKey)
-                    if (titleKey.isNotBlank()) seenTitleKeys.add(titleKey)
-
-                    val id = c.getLong(idCol)
-                    val title = if (rawTitle.isNotBlank()) rawTitle else (File(data).nameWithoutExtension.ifBlank { "Audio Track" })
-                    val artist = if (artistCol != -1) c.getString(artistCol) ?: "XP Phonk Vault" else "XP Phonk Vault"
-                    val rawAlbum = if (albumCol != -1) c.getString(albumCol) ?: "" else ""
-                    val album = if (rawAlbum.isNotBlank()) rawAlbum else "XP Phonk Vault"
-                    val duration = if (durationCol != -1) c.getLong(durationCol) else 0L
-                    val dateModified = if (dateCol != -1) c.getLong(dateCol) * 1000L else 0L
-                    val rawMime = if (mimeCol != -1) c.getString(mimeCol) ?: "" else ""
-                    val mime = if (rawMime.isNotBlank()) rawMime else resolveAudioMime(data)
-                    val ext = if (data.isNotBlank()) File(data).extension.lowercase(Locale.ROOT) else ""
-                    val bitDepth = if (ext in listOf("flac", "alac", "aiff", "aif", "ape", "wv") || mime.contains("flac")) 24 else 16
-
-                    val contentUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id).toString()
-                    val isExact = data.startsWith(targetPath) || data.contains("/phonks", ignoreCase = true)
-
-                    val actualPath = if (data.isNotBlank()) data else contentUri
-                    val streamUrl = if (data.isNotBlank()) "https://appassets.androidplatform.net/local-audio/${Uri.encode(data)}" else contentUri
-
-                    val item = JSONObject().apply {
-                        put("id", id)
-                        put("path", actualPath)
-                        put("contentUri", contentUri)
-                        put("streamUrl", streamUrl)
-                        put("title", title)
-                        put("artist", artist)
-                        put("album", album)
-                        put("bitDepth", bitDepth)
-                        put("duration", duration)
-                        put("size", size)
-                        put("lastModified", dateModified)
-                        put("mimeType", mime)
-                        put("isExactTarget", isExact)
-                    }
-
-                    if (isExact) exactMatches.add(item) else otherMatches.add(item)
                 }
             }
         } catch (e: Exception) {
-            logEvent("ERROR", "MediaStore query error: ${e.message}")
+            logEvent("SCAN", "MediaStore query fallback: ${e.message}")
         }
 
-        // 4. Ensure internal Starter Tracks are available if user tracks are sparse
+        // 3. Ensure internal Starter Tracks ONLY when NO songs exist in the target folder
         val starterDir = File(activity.filesDir, "phonks")
-        if (!starterDir.exists() || (starterDir.listFiles()?.size ?: 0) < 5) {
+        if (exactMatches.isEmpty() && (!starterDir.exists() || (starterDir.listFiles()?.size ?: 0) < 5)) {
             try {
                 VaultTrackSynthesizer.ensureStarterTracks(activity)
             } catch (_: Exception) {}
         }
         val starterMatches = ArrayList<JSONObject>()
-        if (starterDir.exists()) {
+        if (exactMatches.isEmpty() && starterDir.exists()) {
             starterDir.listFiles()?.forEach { file ->
                 if (file.isFile && file.extension.equals("wav", ignoreCase = true) && file.length() > 0) {
                     val path = file.absolutePath
@@ -688,22 +775,20 @@ class AndroidBridge(
             }
         }
 
-        if (exactMatches.isNotEmpty()) {
-            // Target path has exact matches, show them first
-            for (item in exactMatches) jsonArray.put(item)
-        } else if (otherMatches.isNotEmpty()) {
-            // Device has user music
-            for (item in otherMatches) jsonArray.put(item)
-            // If few tracks, append starter tracks so playlist is rich
-            if (otherMatches.size < 3) {
-                for (item in starterMatches) jsonArray.put(item)
+        // Sort: newest songs first, oldest songs last
+        exactMatches.sortWith(compareByDescending<JSONObject> { it.optLong("lastModified", 0L) }.thenByDescending { it.optLong("id", 0L) })
+        starterMatches.sortWith(compareByDescending<JSONObject> { it.optLong("lastModified", 0L) }.thenByDescending { it.optLong("id", 0L) })
+
+        for (item in exactMatches) {
+            jsonArray.put(item)
+        }
+        if (jsonArray.length() == 0) {
+            for (item in starterMatches) {
+                jsonArray.put(item)
             }
-        } else {
-            // No songs on device storage/emulator, show Starter Vault tracks
-            for (item in starterMatches) jsonArray.put(item)
         }
 
-        logEvent("SCAN", "Scan completed: ${jsonArray.length()} tracks loaded natively")
+        logEvent("SCAN", "Strict immediate shallow scan completed: ${jsonArray.length()} tracks loaded natively")
         return jsonArray.toString()
     }
 
@@ -717,168 +802,18 @@ class AndroidBridge(
     // METADATA & COVER ART
     // =========================================================================
 
-    private fun hasEmbeddedPictureFrame(file: File): Boolean {
-        val pLower = file.name.lowercase(Locale.ROOT)
-        if (pLower.endsWith(".wav") || pLower.endsWith(".wave") || pLower.endsWith(".pcm") ||
-            pLower.endsWith(".aiff") || pLower.endsWith(".aif") || pLower.endsWith(".ogg") || pLower.endsWith(".opus")) {
-            return false
-        }
-        if (pLower.endsWith(".mp3")) {
-            try {
-                FileInputStream(file).use { fis ->
-                    val header = ByteArray(10)
-                    if (fis.read(header) < 10) return false
-                    if (header[0] != 'I'.code.toByte() || header[1] != 'D'.code.toByte() || header[2] != '3'.code.toByte()) {
-                        return false
-                    }
-                    val tagSize = (header[6].toInt() and 0x7F shl 21) or
-                            (header[7].toInt() and 0x7F shl 14) or
-                            (header[8].toInt() and 0x7F shl 7) or
-                            (header[9].toInt() and 0x7F)
-                    if (tagSize <= 0) return false
-                    val scanLimit = minOf(tagSize, 256 * 1024)
-                    val buffer = ByteArray(scanLimit)
-                    val readBytes = fis.read(buffer)
-                    if (readBytes <= 4) return false
-                    for (i in 0 until readBytes - 4) {
-                        if (buffer[i] == 'A'.code.toByte() && buffer[i+1] == 'P'.code.toByte() &&
-                            buffer[i+2] == 'I'.code.toByte() && buffer[i+3] == 'C'.code.toByte()) {
-                            return true
-                        }
-                        if (buffer[i] == 'P'.code.toByte() && buffer[i+1] == 'I'.code.toByte() &&
-                            buffer[i+2] == 'C'.code.toByte()) {
-                            return true
-                        }
-                    }
-                    return false
-                }
-            } catch (_: Exception) {
-                return false
-            }
-        } else if (pLower.endsWith(".flac")) {
-            try {
-                FileInputStream(file).use { fis ->
-                    val magic = ByteArray(4)
-                    if (fis.read(magic) < 4) return false
-                    if (magic[0] != 'f'.code.toByte() || magic[1] != 'L'.code.toByte() ||
-                        magic[2] != 'a'.code.toByte() || magic[3] != 'C'.code.toByte()) return false
-                    var isLast = false
-                    while (!isLast) {
-                        val blockHeader = ByteArray(4)
-                        if (fis.read(blockHeader) < 4) break
-                        val b0 = blockHeader[0].toInt() and 0xFF
-                        isLast = (b0 and 0x80) != 0
-                        val blockType = b0 and 0x7F
-                        val length = ((blockHeader[1].toInt() and 0xFF) shl 16) or
-                                ((blockHeader[2].toInt() and 0xFF) shl 8) or
-                                (blockHeader[3].toInt() and 0xFF)
-                        if (blockType == 6) return true
-                        fis.skip(length.toLong())
-                    }
-                    return false
-                }
-            } catch (_: Exception) {
-                return false
-            }
-        } else if (pLower.endsWith(".m4a") || pLower.endsWith(".mp4") || pLower.endsWith(".aac")) {
-            try {
-                FileInputStream(file).use { fis ->
-                    val buf = ByteArray(minOf(file.length().toInt(), 128 * 1024))
-                    val readBytes = fis.read(buf)
-                    for (i in 0 until readBytes - 4) {
-                        if (buf[i] == 'c'.code.toByte() && buf[i+1] == 'o'.code.toByte() &&
-                            buf[i+2] == 'v'.code.toByte() && buf[i+3] == 'r'.code.toByte()) {
-                            return true
-                        }
-                    }
-                    return false
-                }
-            } catch (_: Exception) {
-                return false
-            }
-        }
-        return false
-    }
-
     @JavascriptInterface
     fun getArtBase64(pathOrUri: String): String {
         if (pathOrUri.isBlank()) return ""
-        artBase64Cache.get(pathOrUri)?.let { return it }
-
-        val localFile = if (!pathOrUri.startsWith("content://") && !pathOrUri.startsWith("file:///android_asset/")) {
-            val cleanPath = if (pathOrUri.startsWith("file://")) Uri.parse(pathOrUri).path ?: pathOrUri else pathOrUri
-            File(cleanPath)
-        } else null
-
-        if (localFile != null && (!localFile.exists() || !localFile.isFile)) {
-            artBase64Cache.put(pathOrUri, "")
-            return ""
+        artBase64Cache.get(pathOrUri)?.let {
+            if (it.isNotBlank()) return it
         }
 
-        // 1. First check directory for folder cover image (cover.jpg, folder.jpg) - zero JNI overhead
-        try {
-            if (localFile != null) {
-                val parentDir = localFile.parentFile
-                if (parentDir != null && parentDir.exists() && parentDir.isDirectory) {
-                    val candidateNames = listOf("cover.jpg", "cover.png", "folder.jpg", "folder.png", "album.jpg", "album.png", "art.jpg", "art.png")
-                    for (cName in candidateNames) {
-                        val cand = File(parentDir, cName)
-                        if (cand.exists() && cand.isFile && cand.length() in 1024..5000000) {
-                            val bytes = cand.readBytes()
-                            val mime = if (cName.endsWith(".png")) "image/png" else "image/jpeg"
-                            val base64 = "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
-                            artBase64Cache.put(pathOrUri, base64)
-                            return base64
-                        }
-                    }
-                }
-            }
-        } catch (_: Exception) {}
-
-        // 2. Only invoke JNI MediaMetadataRetriever if file actually contains verified embedded picture
-        val hasVerifiedPicture = if (localFile != null) {
-            hasEmbeddedPictureFrame(localFile)
-        } else if (pathOrUri.startsWith("content://")) {
-            try {
-                activity.contentResolver.openInputStream(Uri.parse(pathOrUri))?.use { input ->
-                    val buf = ByteArray(64 * 1024)
-                    val read = input.read(buf)
-                    var found = false
-                    for (i in 0 until read - 4) {
-                        if ((buf[i] == 'A'.code.toByte() && buf[i+1] == 'P'.code.toByte() && buf[i+2] == 'I'.code.toByte() && buf[i+3] == 'C'.code.toByte()) ||
-                            (buf[i] == 'c'.code.toByte() && buf[i+1] == 'o'.code.toByte() && buf[i+2] == 'v'.code.toByte() && buf[i+3] == 'r'.code.toByte())) {
-                            found = true
-                            break
-                        }
-                    }
-                    found
-                } ?: false
-            } catch (_: Exception) { false }
-        } else false
-
-        if (hasVerifiedPicture) {
-            var retriever: MediaMetadataRetriever? = null
-            try {
-                retriever = MediaMetadataRetriever()
-                if (pathOrUri.startsWith("content://")) {
-                    retriever.setDataSource(activity, Uri.parse(pathOrUri))
-                } else {
-                    retriever.setDataSource(pathOrUri)
-                }
-                val artBytes = retriever.embeddedPicture
-                if (artBytes != null && artBytes.isNotEmpty()) {
-                    val base64 = "data:image/jpeg;base64," + Base64.encodeToString(artBytes, Base64.NO_WRAP)
-                    artBase64Cache.put(pathOrUri, base64)
-                    return base64
-                }
-            } catch (_: Exception) {
-            } finally {
-                try { retriever?.release() } catch (_: Exception) {}
-            }
+        val base64 = CoverArtResolver.getArtBase64(activity, pathOrUri)
+        if (base64.isNotBlank()) {
+            artBase64Cache.put(pathOrUri, base64)
+            return base64
         }
-
-        // Cache negative result so we never query again
-        artBase64Cache.put(pathOrUri, "")
         return ""
     }
 
@@ -1035,6 +970,41 @@ class AndroidBridge(
         return result.toString()
     }
 
+    @JavascriptInterface
+    fun deleteTrack(path: String): Boolean {
+        if (path.isBlank()) return false
+        logEvent("DELETE", "Request to delete track: $path")
+        var deleted = false
+        try {
+            val file = File(path)
+            if (file.exists()) {
+                deleted = file.delete()
+                logEvent("DELETE", "File delete result: $deleted for $path")
+            }
+        } catch (e: Exception) {
+            logEvent("ERROR", "Error deleting physical file: ${e.message}")
+        }
+
+        try {
+            val rows = activity.contentResolver.delete(
+                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                "${MediaStore.Audio.Media.DATA} = ?",
+                arrayOf(path)
+            )
+            if (rows > 0) deleted = true
+        } catch (_: Exception) {}
+
+        try {
+            TrackMetadataStore.deleteOverride(activity, path)
+        } catch (_: Exception) {}
+
+        try {
+            CoverArtResolver.updateCachedArt(activity, path, null, isCoverRemoved = true)
+        } catch (_: Exception) {}
+
+        return deleted
+    }
+
     // =========================================================================
     // SYSTEM & DIAGNOSTICS
     // =========================================================================
@@ -1072,8 +1042,17 @@ class AndroidBridge(
     @JavascriptInterface
     fun exitApp() {
         activity.runOnUiThread {
-            activity.stopPlaybackService()
-            activity.finishAffinity()
+            try {
+                activity.stopPlaybackService()
+            } catch (_: Exception) {}
+            try {
+                activity.finishAndRemoveTask()
+            } catch (_: Exception) {}
+            try {
+                activity.finishAffinity()
+            } catch (_: Exception) {}
+            android.os.Process.killProcess(android.os.Process.myPid())
+            System.exit(0)
         }
     }
 
@@ -1083,8 +1062,71 @@ class AndroidBridge(
     }
 
     @JavascriptInterface
+    fun pickCoverImage() {
+        activity.runOnUiThread { activity.launchCoverPicker() }
+    }
+
+    @JavascriptInterface
+    fun saveTrackMetadata(
+        pathOrUri: String,
+        title: String,
+        artist: String,
+        album: String,
+        coverArtBase64: String,
+        isCoverRemoved: Boolean
+    ): Boolean {
+        logEvent("METADATA", "saveTrackMetadata invoked for: $title by $artist (isCoverRemoved=$isCoverRemoved)")
+        val cleanPath = CoverArtResolver.resolveCleanPath(pathOrUri)
+
+        // 1. Process cover art bytes if new art provided
+        val artBytes: ByteArray? = when {
+            isCoverRemoved -> null
+            !coverArtBase64.isNullOrBlank() && coverArtBase64 != "KEEP_EXISTING" -> {
+                try {
+                    val clean = if (coverArtBase64.contains(",")) coverArtBase64.substringAfter(",") else coverArtBase64
+                    Base64.decode(clean.trim(), Base64.DEFAULT)
+                } catch (_: Exception) { null }
+            }
+            else -> null
+        }
+
+        // 2. Persist custom cover art to internal disk storage
+        if (isCoverRemoved || (artBytes != null && artBytes.isNotEmpty())) {
+            CoverArtResolver.updateCachedArt(activity, cleanPath, artBytes, isCoverRemoved)
+        }
+
+        // 3. Persist metadata overrides permanently in TrackMetadataStore
+        val hasCustomArt = (!isCoverRemoved && (artBytes != null && artBytes.isNotEmpty())) ||
+                CoverArtResolver.getCustomArtFile(activity, cleanPath).exists()
+        TrackMetadataStore.saveOverride(
+            activity,
+            cleanPath,
+            title,
+            artist,
+            album,
+            hasCustomArt = hasCustomArt,
+            isCoverRemoved = isCoverRemoved
+        )
+
+        // 4. Also try native ID3 modification on the physical file
+        try {
+            Id3TagWriter.saveMetadata(activity, pathOrUri, title, artist, album, coverArtBase64, isCoverRemoved)
+        } catch (e: Exception) {
+            logEvent("METADATA", "Native Id3TagWriter: ${e.message}")
+        }
+
+        logEvent("METADATA", "Permanent metadata & artwork saved for: $title")
+        return true
+    }
+
+    @JavascriptInterface
+    fun updateMediaMetadata(title: String, artist: String, isPlaying: Boolean, durationMs: Long, positionMs: Long, artUrl: String) {
+        activity.updateServiceMetadata(title, artist, isPlaying, durationMs, positionMs, artUrl)
+    }
+
+    @JavascriptInterface
     fun updateMediaMetadata(title: String, artist: String, isPlaying: Boolean, durationMs: Long, positionMs: Long) {
-        activity.updateServiceMetadata(title, artist, isPlaying, durationMs, positionMs)
+        activity.updateServiceMetadata(title, artist, isPlaying, durationMs, positionMs, "")
     }
 
     @JavascriptInterface

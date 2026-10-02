@@ -29,6 +29,12 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.util.Base64
+import java.io.ByteArrayOutputStream
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia
 import androidx.activity.ComponentActivity
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -36,6 +42,8 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.webkit.WebViewAssetLoader
 import org.json.JSONObject
 
@@ -64,14 +72,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private var isPageFinished = false
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         val granted = permissions.values.any { it }
         bridge.logEvent("PERMISSION", "Audio permission result: $granted")
-        evaluateJs("window.onAudioPermissionResult && window.onAudioPermissionResult($granted)")
-        if (granted) {
-            evaluateJs("window.scanLocalPhonksFolder && window.scanLocalPhonksFolder()")
+        if (isPageFinished) {
+            evaluateJs("window.onAudioPermissionResult && window.onAudioPermissionResult($granted)")
+            if (granted) {
+                evaluateJs("window.scanLocalPhonksFolder && window.scanLocalPhonksFolder(true)")
+            }
         }
     }
 
@@ -111,6 +123,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val coverPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            handleCoverImagePicked(uri)
+        }
+    }
+
+    private val coverGetContentLauncher = registerForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            handleCoverImagePicked(uri)
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
@@ -144,7 +172,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Create Edge-To-Edge FrameLayout Container
+        // Create Edge-To-Edge FrameLayout Container with safe system window insets
         val rootLayout = FrameLayout(this).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -153,14 +181,24 @@ class MainActivity : ComponentActivity() {
             setBackgroundColor(0xFF07090E.toInt())
         }
 
-        // Ensure WebView Cache, Code Cache, and Crashpad directories exist so Chromium never encounters missing directories during index scan
+        ViewCompat.setOnApplyWindowInsetsListener(rootLayout) { view, windowInsets ->
+            val insets = windowInsets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            view.setPadding(insets.left, insets.top, insets.right, insets.bottom)
+            windowInsets
+        }
+
+        // Clean up any stale partial cache directory so Chromium SimpleCache initializes cleanly
         try {
-            val codeCacheDir = java.io.File(cacheDir, "WebView/Default/HTTP Cache/Code Cache")
-            val wasmDir = java.io.File(codeCacheDir, "wasm")
-            val jsDir = java.io.File(codeCacheDir, "js")
+            val defaultCache = java.io.File(cacheDir, "WebView/Default/HTTP Cache")
+            if (defaultCache.exists()) {
+                val indexFile = java.io.File(defaultCache, "index")
+                if (!indexFile.exists()) {
+                    defaultCache.deleteRecursively()
+                }
+            }
             val crashpadDir = java.io.File(cacheDir, "WebView/Crashpad/attachments")
-            if (!wasmDir.exists()) wasmDir.mkdirs()
-            if (!jsDir.exists()) jsDir.mkdirs()
             if (!crashpadDir.exists()) crashpadDir.mkdirs()
         } catch (_: Exception) {}
 
@@ -171,7 +209,13 @@ class MainActivity : ComponentActivity() {
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
             setBackgroundColor(0xFF07090E.toInt())
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+
+            // Prevent Mesa rendernode errors on virtualized containers/headless emulators lacking /dev/dri
+            try {
+                if (!java.io.File("/dev/dri").exists()) {
+                    setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+                }
+            } catch (_: Exception) {}
 
             settings.apply {
                 javaScriptEnabled = true
@@ -204,6 +248,7 @@ class MainActivity : ComponentActivity() {
 
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
+                    isPageFinished = true
                     bridge.logEvent("WEBVIEW", "Frontend core loaded: $url")
                     // Notify web app that WebView is completely rendered and safe for heavy operations
                     evaluateJs("window.onWebViewFullyReady && window.onWebViewFullyReady()")
@@ -224,6 +269,56 @@ class MainActivity : ComponentActivity() {
                         bridge.logEvent("JS_ERR", consoleMessage.message())
                     }
                     return true
+                }
+
+                override fun onJsConfirm(
+                    view: WebView?,
+                    url: String?,
+                    message: String?,
+                    result: android.webkit.JsResult?
+                ): Boolean {
+                    try {
+                        android.app.AlertDialog.Builder(this@MainActivity)
+                            .setTitle("XP Music Vault")
+                            .setMessage(message ?: "Confirm action?")
+                            .setPositiveButton("DELETE") { dialog: android.content.DialogInterface, _: Int ->
+                                result?.confirm()
+                                dialog.dismiss()
+                            }
+                            .setNegativeButton("CANCEL") { dialog: android.content.DialogInterface, _: Int ->
+                                result?.cancel()
+                                dialog.dismiss()
+                            }
+                            .setOnCancelListener { result?.cancel() }
+                            .show()
+                        return true
+                    } catch (e: Exception) {
+                        result?.cancel()
+                        return false
+                    }
+                }
+
+                override fun onJsAlert(
+                    view: WebView?,
+                    url: String?,
+                    message: String?,
+                    result: android.webkit.JsResult?
+                ): Boolean {
+                    try {
+                        android.app.AlertDialog.Builder(this@MainActivity)
+                            .setTitle("XP Music Vault")
+                            .setMessage(message ?: "")
+                            .setPositiveButton("OK") { dialog: android.content.DialogInterface, _: Int ->
+                                result?.confirm()
+                                dialog.dismiss()
+                            }
+                            .setOnCancelListener { result?.confirm() }
+                            .show()
+                        return true
+                    } catch (e: Exception) {
+                        result?.confirm()
+                        return false
+                    }
                 }
             }
         }
@@ -265,6 +360,50 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    fun launchCoverPicker() {
+        try {
+            coverPickerLauncher.launch(
+                PickVisualMediaRequest(PickVisualMedia.ImageOnly)
+            )
+        } catch (e: Exception) {
+            try {
+                coverGetContentLauncher.launch("image/*")
+            } catch (e2: Exception) {
+                bridge.logEvent("COVER", "Image picker launch failed: ${e.message}")
+            }
+        }
+    }
+
+    private fun handleCoverImagePicked(uri: Uri) {
+        try {
+            contentResolver.openInputStream(uri)?.use { inputStream ->
+                val rawBytes = inputStream.readBytes()
+                val bmp = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size)
+                if (bmp != null) {
+                    val maxDim = maxOf(bmp.width, bmp.height)
+                    val targetBmp = if (maxDim > 512) {
+                        val scale = 512f / maxDim
+                        Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true)
+                    } else {
+                        bmp
+                    }
+                    val bos = ByteArrayOutputStream()
+                    targetBmp.compress(Bitmap.CompressFormat.JPEG, 88, bos)
+                    if (targetBmp != bmp) targetBmp.recycle()
+                    bmp.recycle()
+                    val jpegBytes = bos.toByteArray()
+                    val b64 = "data:image/jpeg;base64," + Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
+                    bridge.logEvent("COVER", "Cover picked & encoded (${jpegBytes.size} bytes)")
+                    runOnUiThread {
+                        evaluateJs("window.onCoverImagePicked && window.onCoverImagePicked('$b64')")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            bridge.logEvent("ERROR", "handleCoverImagePicked failed: ${e.message}")
+        }
+    }
+
     fun checkAudioPermission(): Boolean {
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -303,18 +442,26 @@ class MainActivity : ComponentActivity() {
 
     fun getAudioService(): AudioVaultService? = audioVaultService
 
-    fun updateServiceMetadata(title: String, artist: String, isPlaying: Boolean, durationMs: Long, positionMs: Long) {
-        audioVaultService?.updateServiceState(title, artist, isPlaying, durationMs, positionMs)
+    fun updateServiceMetadata(title: String, artist: String, isPlaying: Boolean, durationMs: Long, positionMs: Long, artUrl: String = "") {
+        audioVaultService?.updateServiceState(title, artist, isPlaying, durationMs, positionMs, artUrl)
     }
 
     fun stopPlaybackService() {
+        try {
+            audioVaultService?.apply {
+                pausePlayback()
+                stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE)
+            }
+        } catch (_: Exception) {}
         if (isServiceBound) {
             try {
                 unbindService(serviceConnection)
             } catch (_: Exception) {}
             isServiceBound = false
         }
-        stopService(Intent(this, AudioVaultService::class.java))
+        try {
+            stopService(Intent(this, AudioVaultService::class.java))
+        } catch (_: Exception) {}
     }
 
     fun setSystemFullscreen(fullscreen: Boolean) {
@@ -364,6 +511,16 @@ class MainActivity : ComponentActivity() {
     override fun onBackPressed() {
         evaluateJs("if (window.handleBackPress && window.handleBackPress()) { /* Handled */ } else { AndroidBridge.logEvent('NAV', 'Exit via Back'); window.location.href = 'about:blank'; }")
         super.onBackPressed()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        evaluateJs("window.onNativeVisibilityChanged && window.onNativeVisibilityChanged(false)")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        evaluateJs("window.onNativeVisibilityChanged && window.onNativeVisibilityChanged(true)")
     }
 
     override fun onDestroy() {

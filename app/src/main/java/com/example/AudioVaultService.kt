@@ -1,5 +1,6 @@
 package com.example
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,10 +10,14 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaPlayer
+import android.media.audiofx.AudioEffect
 import android.media.audiofx.BassBoost
 import android.media.audiofx.Equalizer
 import android.media.audiofx.Virtualizer
@@ -30,6 +35,7 @@ import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Base64
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import java.io.File
 import kotlin.math.abs
@@ -58,6 +64,7 @@ class AudioVaultService : Service() {
     private var bassBoost: BassBoost? = null
     private var virtualizer: Virtualizer? = null
     private var visualizer: Visualizer? = null
+    private var isVisualizerSupported: Boolean? = null
     private var powerManager: PowerManager? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var audioManager: AudioManager? = null
@@ -167,6 +174,13 @@ class AudioVaultService : Service() {
     fun playTrack(pathOrUri: String, title: String = "", artist: String = "", album: String = ""): Boolean {
         if (pathOrUri.isBlank()) return false
 
+        // RESUME LOGIC: If user tapped play on the already prepared track while paused, resume seamlessly
+        val existingMp = mediaPlayer
+        if (pathOrUri == currentPath && existingMp != null && isPrepared && !isTrackPlaying) {
+            Log.d(tag, "playTrack called for current paused track: resuming from ${existingMp.currentPosition}ms")
+            return resumePlayback()
+        }
+
         currentPath = pathOrUri
         if (title.isNotBlank()) currentTitle = title
         if (artist.isNotBlank()) currentArtist = artist
@@ -181,11 +195,21 @@ class AudioVaultService : Service() {
 
             mediaPlayer?.apply {
                 try {
-                    stop()
+                    setOnPreparedListener(null)
+                    setOnCompletionListener(null)
+                    setOnErrorListener(null)
+                    if (isPlaying) {
+                        pause()
+                    }
+                } catch (_: Exception) {}
+                try {
                     reset()
+                } catch (_: Exception) {}
+                try {
                     release()
                 } catch (_: Exception) {}
             }
+            mediaPlayer = null
 
             mediaPlayer = MediaPlayer().apply {
                 setWakeMode(applicationContext, PowerManager.PARTIAL_WAKE_LOCK)
@@ -290,6 +314,7 @@ class AudioVaultService : Service() {
                 setOnPreparedListener { mp ->
                     isPrepared = true
                     currentDurationMs = mp.duration.toLong()
+                    masterVolume = 1.0f
                     mp.start()
                     isTrackPlaying = true
 
@@ -308,7 +333,7 @@ class AudioVaultService : Service() {
                     stopProgressUpdates()
                     updateServiceState(currentTitle, currentArtist, false, currentDurationMs, currentDurationMs)
                     onPlaybackStateChanged?.invoke(false, currentDurationMs, currentDurationMs)
-                    onActionCallback?.invoke("NEXT")
+                    // Rely strictly on onPlaybackCompleted (do NOT fire NEXT action callback to prevent double skip)
                     onPlaybackCompleted?.invoke()
                 }
 
@@ -360,15 +385,20 @@ class AudioVaultService : Service() {
     @Synchronized
     fun pausePlayback() {
         try {
+            isTrackPlaying = false
+            stopProgressUpdates()
+            releaseWakeLock()
             val mp = mediaPlayer
-            if (mp != null && mp.isPlaying) {
-                mp.pause()
-                isTrackPlaying = false
-                stopProgressUpdates()
-                releaseWakeLock()
-                val pos = mp.currentPosition.toLong()
+            if (mp != null) {
+                try {
+                    if (mp.isPlaying) mp.pause()
+                } catch (_: Exception) {}
+                val pos = try { mp.currentPosition.toLong() } catch (_: Exception) { 0L }
                 updateServiceState(currentTitle, currentArtist, false, currentDurationMs, pos)
                 onPlaybackStateChanged?.invoke(false, pos, currentDurationMs)
+            } else {
+                updateServiceState(currentTitle, currentArtist, false, currentDurationMs, 0L)
+                onPlaybackStateChanged?.invoke(false, 0L, currentDurationMs)
             }
         } catch (e: Exception) {
             Log.e(tag, "pausePlayback error: ${e.message}")
@@ -397,6 +427,10 @@ class AudioVaultService : Service() {
         }
     }
 
+    fun isAudioPlaying(): Boolean = isTrackPlaying && isPlaying()
+
+    fun getCurrentTrackPath(): String = currentPath
+
     fun getCurrentPosition(): Long {
         return try {
             mediaPlayer?.currentPosition?.toLong() ?: 0L
@@ -420,22 +454,59 @@ class AudioVaultService : Service() {
     private fun initEqualizer(audioSessionId: Int) {
         try {
             equalizer?.release()
-            equalizer = Equalizer(0, audioSessionId).apply {
-                enabled = true
+            equalizer = null
+            try {
+                equalizer = Equalizer(0, audioSessionId).apply {
+                    enabled = true
+                }
+                Log.d(tag, "Native Equalizer bound to session $audioSessionId")
+            } catch (e1: Exception) {
+                Log.w(tag, "Session $audioSessionId Equalizer failed: ${e1.message}, trying session 0")
+                try {
+                    equalizer = Equalizer(0, 0).apply {
+                        enabled = true
+                    }
+                    Log.d(tag, "Global Equalizer bound to session 0")
+                } catch (e2: Exception) {
+                    Log.w(tag, "Global Equalizer fallback failed: ${e2.message}")
+                    equalizer = null
+                }
             }
         } catch (_: Exception) {}
 
         try {
             bassBoost?.release()
-            bassBoost = BassBoost(0, audioSessionId).apply {
-                enabled = true
+            bassBoost = null
+            try {
+                bassBoost = BassBoost(0, audioSessionId).apply {
+                    enabled = true
+                }
+            } catch (_: Exception) {
+                try {
+                    bassBoost = BassBoost(0, 0).apply {
+                        enabled = true
+                    }
+                } catch (_: Exception) {
+                    bassBoost = null
+                }
             }
         } catch (_: Exception) {}
 
         try {
             virtualizer?.release()
-            virtualizer = Virtualizer(0, audioSessionId).apply {
-                enabled = true
+            virtualizer = null
+            try {
+                virtualizer = Virtualizer(0, audioSessionId).apply {
+                    enabled = true
+                }
+            } catch (_: Exception) {
+                try {
+                    virtualizer = Virtualizer(0, 0).apply {
+                        enabled = true
+                    }
+                } catch (_: Exception) {
+                    virtualizer = null
+                }
             }
         } catch (_: Exception) {}
 
@@ -455,50 +526,70 @@ class AudioVaultService : Service() {
         if (eq != null) {
             try {
                 val numBands = eq.numberOfBands.toInt()
-                val minRange = eq.bandLevelRange[0] // e.g. -1500 mB (-15dB)
-                val maxRange = eq.bandLevelRange[1] // e.g. +1500 mB (+15dB)
+                val range = try { eq.bandLevelRange } catch (_: Exception) { null }
+                val minRange = if (range != null && range.size >= 2) range[0] else -1500.toShort()
+                val maxRange = if (range != null && range.size >= 2) range[1] else 1500.toShort()
 
                 fun dbToMb(db: Float): Short {
                     val mb = (db * 100).toInt()
                     return mb.coerceIn(minRange.toInt(), maxRange.toInt()).toShort()
                 }
 
-                val lowMb = dbToMb(eqLowDb)
-                val midMb = dbToMb(eqMidDb)
-                val highMb = dbToMb(eqHighDb)
-
-                if (numBands >= 5) {
-                    // 5-Band Standard: 0=60Hz(Sub-Bass), 1=230Hz(Punch), 2=910Hz(Body/Vocals), 3=3.6kHz(Clarity), 4=14kHz(Air)
-                    eq.setBandLevel(0, lowMb)
-                    eq.setBandLevel(1, (lowMb * 0.65f + midMb * 0.35f).toInt().toShort())
-                    eq.setBandLevel(2, midMb)
-                    eq.setBandLevel(3, (midMb * 0.35f + highMb * 0.65f).toInt().toShort())
-                    eq.setBandLevel(4, highMb)
-                } else if (numBands in 3..4) {
-                    eq.setBandLevel(0, lowMb)
-                    eq.setBandLevel(1, midMb)
-                    eq.setBandLevel((numBands - 1).toShort(), highMb)
-                } else if (numBands > 0) {
-                    eq.setBandLevel(0, lowMb)
+                if (numBands > 0) {
+                    for (b in 0 until numBands) {
+                        val centerHz = try { eq.getCenterFreq(b.toShort()) / 1000 } catch (_: Exception) { 0 }
+                        val targetDb: Float = if (centerHz > 0) {
+                            when {
+                                centerHz < 200 -> eqLowDb
+                                centerHz in 200..350 -> {
+                                    val t = (centerHz - 200).toFloat() / 150f
+                                    eqLowDb * (1f - t) + eqMidDb * t
+                                }
+                                centerHz in 351..2200 -> eqMidDb
+                                centerHz in 2201..3800 -> {
+                                    val t = (centerHz - 2201).toFloat() / 1600f
+                                    eqMidDb * (1f - t) + eqHighDb * t
+                                }
+                                else -> eqHighDb
+                            }
+                        } else {
+                            val norm = if (numBands > 1) b.toFloat() / (numBands - 1) else 0.5f
+                            when {
+                                norm <= 0.35f -> {
+                                    val t = norm / 0.35f
+                                    eqLowDb * (1f - t) + (eqLowDb * 0.5f + eqMidDb * 0.5f) * t
+                                }
+                                norm <= 0.65f -> {
+                                    val t = (norm - 0.35f) / 0.30f
+                                    (eqLowDb * 0.5f + eqMidDb * 0.5f) * (1f - t) + eqMidDb * t
+                                }
+                                else -> {
+                                    val t = (norm - 0.65f) / 0.35f
+                                    eqMidDb * (1f - t) + eqHighDb * t
+                                }
+                            }
+                        }
+                        eq.setBandLevel(b.toShort(), dbToMb(targetDb))
+                    }
+                    eq.enabled = true
                 }
-                eq.enabled = true
             } catch (_: Exception) {}
         }
 
         // Realistic Hardware BassBoost enhancement (physical low-end transducer drive)
         try {
             val bb = bassBoost
-            if (bb != null) {
-                if (eqLowDb > 0.5f) {
-                    val strength = ((eqLowDb / 15f).coerceIn(0f, 1f) * 1000).toInt().toShort()
-                    if (bb.strengthSupported) {
-                        bb.setStrength(strength)
-                    }
+            if (bb != null && bb.strengthSupported) {
+                val isDolby = spatialMode == "atmos"
+                if (isDolby) {
                     bb.enabled = true
+                    bb.setStrength(850.toShort())
+                } else if (eqLowDb > 0.5f) {
+                    val strength = ((eqLowDb / 15f).coerceIn(0f, 1f) * 1000).toInt().toShort()
+                    bb.enabled = true
+                    bb.setStrength(strength)
                 } else {
-                    if (bb.strengthSupported) {
-                        bb.setStrength(0.toShort())
-                    }
+                    bb.setStrength(0.toShort())
                     bb.enabled = false
                 }
             }
@@ -507,27 +598,50 @@ class AudioVaultService : Service() {
         // Realistic 3D Spatial Virtualizer (wide soundstage and cyber presence)
         try {
             val virt = virtualizer
-            if (virt != null) {
-                val isBoosted = eqHighDb > 2.0f || abs(currentPan) > 0.05f
-                if (isBoosted && virt.strengthSupported) {
-                    val strength = ((eqHighDb.coerceAtLeast(0f) / 15f) * 550 + (abs(currentPan) * 450)).toInt().coerceIn(0, 1000).toShort()
-                    virt.setStrength(strength)
+            if (virt != null && virt.strengthSupported) {
+                val isDolby = spatialMode == "atmos"
+                val is8D = spatialMode in listOf("8d", "orbit", "gyro")
+                if (isDolby) {
                     virt.enabled = true
-                } else if (virt.strengthSupported) {
-                    virt.setStrength(0.toShort())
-                    virt.enabled = false
+                    virt.setStrength(1000.toShort())
+                } else if (is8D) {
+                    virt.enabled = true
+                    virt.setStrength(800.toShort())
+                } else {
+                    val isBoosted = eqHighDb > 2.0f || abs(currentPan) > 0.05f
+                    if (isBoosted) {
+                        val strength = ((eqHighDb.coerceAtLeast(0f) / 15f) * 550 + (abs(currentPan) * 450)).toInt().coerceIn(0, 1000).toShort()
+                        virt.setStrength(strength)
+                        virt.enabled = true
+                    } else {
+                        virt.setStrength(0.toShort())
+                        virt.enabled = false
+                    }
                 }
             }
         } catch (_: Exception) {}
+        // Apply real-time headroom compensation to prevent digital clipping on heavy boosts
+        applyStereoPanning()
     }
 
     // =========================================================================
-    // NATIVE 3D SPATIAL STEREO PANNING
+    // NATIVE 3D SPATIAL STEREO PANNING & STUDIO HEADROOM
     // =========================================================================
+
+    private var spatialMode: String = "atmos"
+
+    @Synchronized
+    fun setSpatialMode(mode: String) {
+        spatialMode = mode.lowercase(java.util.Locale.ROOT)
+        Log.d(tag, "Spatial DSP Mode switched to: $spatialMode")
+        applyEqualizerSettings()
+    }
 
     @Synchronized
     fun setSpatialPan(pan: Float) {
-        currentPan = pan.coerceIn(-1.0f, 1.0f)
+        val newPan = pan.coerceIn(-1.0f, 1.0f)
+        if (Math.abs(currentPan - newPan) < 0.015f) return
+        currentPan = newPan
         applyStereoPanning()
     }
 
@@ -540,10 +654,17 @@ class AudioVaultService : Service() {
     private fun applyStereoPanning() {
         val mp = mediaPlayer ?: return
         try {
+            // Adaptive studio headroom scaling when EQ bands are boosted to prevent distortion
+            val maxBoost = maxOf(0f, eqLowDb, eqMidDb, eqHighDb)
+            val headroomScale = if (maxBoost > 2.0f) {
+                1.0f / (1.0f + (maxBoost - 2.0f) * 0.036f)
+            } else 1.0f
+
+            val effVolume = (masterVolume * headroomScale).coerceIn(0f, 1.0f)
             // Constant-power / linear cross-balance stereo panning
-            val left = if (currentPan <= 0f) 1.0f else (1.0f - currentPan)
-            val right = if (currentPan >= 0f) 1.0f else (1.0f + currentPan)
-            mp.setVolume(left * masterVolume, right * masterVolume)
+            val left = (if (currentPan <= 0f) 1.0f else (1.0f - currentPan)) * effVolume
+            val right = (if (currentPan >= 0f) 1.0f else (1.0f + currentPan)) * effVolume
+            mp.setVolume(left.coerceIn(0f, 1.0f), right.coerceIn(0f, 1.0f))
         } catch (_: Exception) {
         }
     }
@@ -552,20 +673,61 @@ class AudioVaultService : Service() {
     // NATIVE VISUALIZER API (FFT CAPTURE & EQ-REACTIVE REAL-TIME SPECTRUM)
     // =========================================================================
 
+    private fun canUseHardwareVisualizer(): Boolean {
+        if (isVisualizerSupported != null) return isVisualizerSupported == true
+        try {
+            // Check RECORD_AUDIO permission required on Android 9+ for native visualizers
+            val hasPerm = ContextCompat.checkSelfPermission(
+                applicationContext,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!hasPerm) {
+                isVisualizerSupported = false
+                return false
+            }
+
+            // Verify AudioFlinger has the visualization effect library loaded in the HAL
+            val effects = AudioEffect.queryEffects()
+            val hasVisualizerEffect = effects?.any { desc ->
+                desc.type?.toString()?.equals("e46b26a0-dddd-11db-8afd-0002a5d5c51b", ignoreCase = true) == true ||
+                desc.uuid?.toString()?.equals("e46b26a0-dddd-11db-8afd-0002a5d5c51b", ignoreCase = true) == true ||
+                desc.implementor?.contains("visualizer", ignoreCase = true) == true ||
+                desc.name?.contains("visualizer", ignoreCase = true) == true
+            } ?: false
+
+            if (!hasVisualizerEffect) {
+                isVisualizerSupported = false
+                return false
+            }
+        } catch (_: Throwable) {
+            isVisualizerSupported = false
+            return false
+        }
+        return true
+    }
+
     private fun initVisualizer(audioSessionId: Int) {
+        if (!canUseHardwareVisualizer()) {
+            visualizerActive = false
+            return
+        }
         try {
             visualizer?.release()
             val range = try { Visualizer.getCaptureSizeRange() } catch (_: Exception) { null }
             val chosenSize = if (range != null && range.size >= 2) {
                 range[0].coerceAtLeast(64).coerceAtMost(256)
             } else 128
-            visualizer = Visualizer(audioSessionId).apply {
-                captureSize = chosenSize
-                enabled = true
-            }
+            val vis = Visualizer(audioSessionId)
+            vis.captureSize = chosenSize
+            vis.enabled = true
+            visualizer = vis
             visualizerActive = true
-        } catch (e: Exception) {
+            isVisualizerSupported = true
+        } catch (_: Throwable) {
             visualizerActive = false
+            isVisualizerSupported = false
+            try { visualizer?.release() } catch (_: Exception) {}
+            visualizer = null
         }
     }
 
@@ -583,10 +745,10 @@ class AudioVaultService : Service() {
         val posMs = try { mediaPlayer?.currentPosition ?: 0 } catch (_: Exception) { 0 }
 
         // Real-time EQ Gain multipliers directly modulating the visualizer spectrum
-        // -15dB -> ~0.18x, 0dB -> 1.0x, +15dB -> ~2.8x
-        val lowGain = Math.pow(10.0, (eqLowDb / 20.0)).toFloat().coerceIn(0.15f, 3.2f)
-        val midGain = Math.pow(10.0, (eqMidDb / 20.0)).toFloat().coerceIn(0.15f, 3.2f)
-        val highGain = Math.pow(10.0, (eqHighDb / 20.0)).toFloat().coerceIn(0.15f, 3.2f)
+        // -15dB -> ~0.10x, 0dB -> 1.0x, +15dB -> ~3.8x
+        val lowGain = Math.pow(10.0, (eqLowDb / 20.0)).toFloat().coerceIn(0.10f, 3.8f)
+        val midGain = Math.pow(10.0, (eqMidDb / 20.0)).toFloat().coerceIn(0.10f, 3.8f)
+        val highGain = Math.pow(10.0, (eqHighDb / 20.0)).toFloat().coerceIn(0.10f, 3.8f)
 
         var hasHardwareFft = false
         if (vis != null && visualizerActive) {
@@ -774,9 +936,14 @@ class AudioVaultService : Service() {
                 .setAcceptsDelayedFocusGain(true)
                 .setOnAudioFocusChangeListener { focusChange ->
                     when (focusChange) {
-                        AudioManager.AUDIOFOCUS_LOSS -> pausePlayback()
-                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> pausePlayback()
-                        AudioManager.AUDIOFOCUS_GAIN -> resumePlayback()
+                        AudioManager.AUDIOFOCUS_LOSS, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                            pausePlayback()
+                            onAudioFocusChanged?.invoke(true)
+                        }
+                        AudioManager.AUDIOFOCUS_GAIN -> {
+                            onAudioFocusChanged?.invoke(false)
+                            resumePlayback()
+                        }
                     }
                 }
                 .build()
@@ -786,9 +953,11 @@ class AudioVaultService : Service() {
             @Suppress("DEPRECATION")
             am.requestAudioFocus(
                 { focusChange ->
-                    if (focusChange == AudioManager.AUDIOFOCUS_LOSS || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+                    if (focusChange == AudioManager.AUDIOFOCUS_LOSS || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
                         pausePlayback()
+                        onAudioFocusChanged?.invoke(true)
                     } else if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
+                        onAudioFocusChanged?.invoke(false)
                         resumePlayback()
                     }
                 },
@@ -854,11 +1023,92 @@ class AudioVaultService : Service() {
         }
     }
 
+    private val artExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private var currentAlbumArtBitmap: Bitmap? = null
+    private var lastDecodedArtKey: String? = null
+
+    private fun requestAsyncArtDecode(artUrlOrBase64: String) {
+        if (artUrlOrBase64.isBlank()) return
+        val key = if (artUrlOrBase64.length > 120) {
+            "${artUrlOrBase64.length}_${artUrlOrBase64.take(40)}_${artUrlOrBase64.takeLast(20)}"
+        } else {
+            artUrlOrBase64
+        }
+        if (key == lastDecodedArtKey && currentAlbumArtBitmap != null) {
+            return
+        }
+
+        artExecutor.execute {
+            try {
+                var bmp: Bitmap? = null
+                // Case 1: Base64 data URI or raw base64 string
+                if (artUrlOrBase64.startsWith("data:image") || (artUrlOrBase64.length > 80 && !artUrlOrBase64.startsWith("http"))) {
+                    val cleanBase64 = if (artUrlOrBase64.contains(",")) {
+                        artUrlOrBase64.substringAfter(",")
+                    } else {
+                        artUrlOrBase64
+                    }
+                    val bytes = Base64.decode(cleanBase64, Base64.DEFAULT)
+                    bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                }
+
+                // Case 2: File path, content URI, or appassets URL via CoverArtResolver
+                if (bmp == null) {
+                    val bytes = CoverArtResolver.getArtBytes(this, artUrlOrBase64)
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    }
+                }
+
+                if (bmp != null) {
+                    lastDecodedArtKey = key
+                    currentAlbumArtBitmap = bmp
+                    progressHandler.post {
+                        applyMetadataAndNotification()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(tag, "Failed to decode album art for MediaSession: ${e.message}")
+            }
+        }
+    }
+
+    private fun applyMetadataAndNotification() {
+        val metaBuilder = MediaMetadataCompat.Builder()
+            .putString(MediaMetadataCompat.METADATA_KEY_TITLE, currentTitle)
+            .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, currentArtist)
+            .putString(MediaMetadataCompat.METADATA_KEY_ALBUM, currentAlbum)
+            .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, currentDurationMs)
+
+        currentAlbumArtBitmap?.let { bmp ->
+            metaBuilder.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, bmp)
+            metaBuilder.putBitmap(MediaMetadataCompat.METADATA_KEY_ART, bmp)
+        }
+
+        mediaSession?.setMetadata(metaBuilder.build())
+        val notification = buildNotification()
+        startForeground(NOTIFICATION_ID, notification)
+    }
+
     fun updateServiceState(title: String, artist: String, isPlaying: Boolean, durationMs: Long, positionMs: Long) {
+        updateServiceState(title, artist, isPlaying, durationMs, positionMs, "")
+    }
+
+    fun updateServiceState(title: String, artist: String, isPlaying: Boolean, durationMs: Long, positionMs: Long, artUrl: String) {
         currentTitle = title
         currentArtist = artist
         isTrackPlaying = isPlaying
-        currentDurationMs = durationMs
+        if (durationMs > 0L) {
+            currentDurationMs = durationMs
+        } else if (currentDurationMs <= 0L) {
+            currentDurationMs = mediaPlayer?.duration?.toLong() ?: 0L
+        }
+
+        if (artUrl.isNotBlank()) {
+            requestAsyncArtDecode(artUrl)
+        } else if (currentAlbumArtBitmap == null && currentPath.isNotBlank()) {
+            requestAsyncArtDecode(currentPath)
+        }
 
         val state = if (isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
         val actions = PlaybackStateCompat.ACTION_PLAY or
@@ -876,17 +1126,7 @@ class AudioVaultService : Service() {
                 .build()
         )
 
-        mediaSession?.setMetadata(
-            MediaMetadataCompat.Builder()
-                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
-                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist)
-                .putString(MediaMetadataCompat.METADATA_KEY_ALBUM, currentAlbum)
-                .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, durationMs)
-                .build()
-        )
-
-        val notification = buildNotification()
-        startForeground(NOTIFICATION_ID, notification)
+        applyMetadataAndNotification()
     }
 
     private fun buildNotification(): Notification {
@@ -926,7 +1166,7 @@ class AudioVaultService : Service() {
             createActionPendingIntent(ACTION_NEXT)
         )
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val notifBuilder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle(currentTitle)
             .setContentText(currentArtist)
@@ -942,7 +1182,12 @@ class AudioVaultService : Service() {
                     .setMediaSession(mediaSession?.sessionToken)
                     .setShowActionsInCompactView(0, 1, 2)
             )
-            .build()
+
+        currentAlbumArtBitmap?.let { bmp ->
+            notifBuilder.setLargeIcon(bmp)
+        }
+
+        return notifBuilder.build()
     }
 
     private fun createActionPendingIntent(action: String): PendingIntent {
@@ -984,9 +1229,18 @@ class AudioVaultService : Service() {
 
         try {
             mediaPlayer?.apply {
-                stop()
-                reset()
-                release()
+                setOnPreparedListener(null)
+                setOnCompletionListener(null)
+                setOnErrorListener(null)
+                try {
+                    if (isPlaying) pause()
+                } catch (_: Exception) {}
+                try {
+                    reset()
+                } catch (_: Exception) {}
+                try {
+                    release()
+                } catch (_: Exception) {}
             }
             mediaPlayer = null
         } catch (_: Exception) {}
@@ -1014,5 +1268,6 @@ class AudioVaultService : Service() {
         var onActionCallback: ((String) -> Unit)? = null
         var onPlaybackStateChanged: ((Boolean, Long, Long) -> Unit)? = null
         var onPlaybackCompleted: (() -> Unit)? = null
+        var onAudioFocusChanged: ((Boolean) -> Unit)? = null
     }
 }
